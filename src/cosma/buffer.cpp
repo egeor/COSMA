@@ -815,5 +815,6 @@ template class Buffer<double>;
 template class Buffer<std::complex<double>>;
 template class Buffer<float>;
 template class Buffer<std::complex<float>>;
+template class Buffer<cosma::bfloat16>;
 
 } // namespace cosma

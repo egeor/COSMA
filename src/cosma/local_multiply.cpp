@@ -1,5 +1,6 @@
 #include "cosma/context.hpp"
 #include <cosma/local_multiply.hpp>
+#include <cosma/bfloat16.hpp>
 #include <cosma/profiler.hpp>
 #include <cosma/timer.hpp>
 
@@ -472,6 +473,18 @@ local_multiply<std::complex<float>>(cosma_context<std::complex<float>> *ctx,
                                     std::complex<float> beta,
                                     bool copy_c_back);
 
+template void
+local_multiply<cosma::bfloat16>(cosma_context<cosma::bfloat16> *ctx,
+                                cosma::bfloat16 *matrixA,
+                                cosma::bfloat16 *matrixB,
+                                cosma::bfloat16 *matrixC,
+                                int m,
+                                int n,
+                                int k,
+                                cosma::bfloat16 alpha,
+                                cosma::bfloat16 beta,
+                                bool copy_c_back);
+
 // explicit template instantiation using context - no pinning
 template void local_multiply_cpu<double>(double *matrixA,
                                          double *matrixB,
@@ -510,6 +523,16 @@ local_multiply_cpu<std::complex<float>>(std::complex<float> *matrixA,
                                         int k,
                                         std::complex<float> alpha,
                                         std::complex<float> beta);
+
+template void
+local_multiply_cpu<cosma::bfloat16>(cosma::bfloat16 *matrixA,
+                                    cosma::bfloat16 *matrixB,
+                                    cosma::bfloat16 *matrixC,
+                                    int m,
+                                    int n,
+                                    int k,
+                                    cosma::bfloat16 alpha,
+                                    cosma::bfloat16 beta);
 
 // explicit template instantiation using context with unique_ptr context
 template void local_multiply<double>(context<double> &ctx,
@@ -557,7 +580,17 @@ local_multiply<std::complex<float>>(context<std::complex<float>> &ctx,
                                     std::complex<float> alpha,
                                     std::complex<float> beta,
                                     bool copy_c_back);
-
+template void
+local_multiply<cosma::bfloat16>(context<cosma::bfloat16> &ctx,
+                                cosma::bfloat16 *matrixA,
+                                cosma::bfloat16 *matrixB,
+                                cosma::bfloat16 *matrixC,
+                                int m,
+                                int n,
+                                int k,
+                                cosma::bfloat16 alpha,
+                                cosma::bfloat16 beta,
+                                bool copy_c_back);
 // explicit instantiation without context
 template void local_multiply<double>(double *matrixA,
                                      double *matrixB,
@@ -599,6 +632,16 @@ template void local_multiply<std::complex<float>>(std::complex<float> *matrixA,
                                                   std::complex<float> alpha,
                                                   std::complex<float> beta,
                                                   bool copy_c_back);
+
+template void local_multiply<cosma::bfloat16>(cosma::bfloat16 *matrixA,
+                                             cosma::bfloat16 *matrixB,
+                                             cosma::bfloat16 *matrixC,
+                                             int m,
+                                             int n,
+                                             int k,
+                                             cosma::bfloat16 alpha,
+                                             cosma::bfloat16 beta,
+                                             bool copy_c_back);
 
 #ifdef COSMA_HAVE_GPU
 // explicit template instantiation using gpu context

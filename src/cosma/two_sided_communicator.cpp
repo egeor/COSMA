@@ -2,6 +2,7 @@
 #include <cosma/math_utils.hpp>
 #include <cosma/matrix.hpp>
 #include <cosma/mpi_mapper.hpp>
+#include <cosma/bfloat16.hpp>
 #include <cosma/profiler.hpp>
 #include <cosma/strategy.hpp>
 #include <cosma/two_sided_communicator.hpp>
@@ -198,19 +199,20 @@ void reduce(MPI_Comm comm,
     auto mpi_type = mpi_mapper<Scalar>::getType();
     PE(multiply_communication_reduce);
 
+    auto mpi_sum = mpi_mapper<Scalar>::getSumOp();
     if (same_size) {
         MPI_Reduce_scatter_block(send_pointer,
                            receive_pointer,
                            recvcnts[0],
                            mpi_type,
-                           MPI_SUM,
+                           mpi_sum,
                            comm);
     } else {
         MPI_Reduce_scatter(send_pointer,
                            receive_pointer,
                            recvcnts.data(),
                            mpi_type,
-                           MPI_SUM,
+                           mpi_sum,
                            comm);
     }
     PL();
@@ -271,6 +273,18 @@ copy<std::complex<double>>(MPI_Comm comm,
                            std::vector<int> &total_before,
                            int total_after);
 
+template void
+copy<cosma::bfloat16>(MPI_Comm comm,
+                      int rank,
+                      int div,
+                      Interval &P,
+                      cosma::bfloat16 *in,
+                      cosma::bfloat16 *out,
+                      cosma::bfloat16 *reshuffle_buffer,
+                      std::vector<std::vector<int>> &size_before,
+                      std::vector<int> &total_before,
+                      int total_after);
+
 template void reduce<float>(MPI_Comm comm,
                             int rank,
                             int div,
@@ -328,6 +342,21 @@ reduce<std::complex<double>>(MPI_Comm comm,
                              std::vector<std::vector<int>> &c_expanded,
                              std::vector<int> &c_total_expanded,
                              std::complex<double> beta);
+
+template void
+reduce<cosma::bfloat16>(MPI_Comm comm,
+                        int rank,
+                        int div,
+                        Interval &P,
+                        cosma::bfloat16 *LC,
+                        cosma::bfloat16 *C,
+                        cosma::bfloat16 *reshuffle_buffer,
+                        cosma::bfloat16 *reduce_buffer,
+                        std::vector<std::vector<int>> &c_current,
+                        std::vector<int> &c_total_current,
+                        std::vector<std::vector<int>> &c_expanded,
+                        std::vector<int> &c_total_expanded,
+                        cosma::bfloat16 beta);
 
 } // end namespace two_sided_communicator
 
