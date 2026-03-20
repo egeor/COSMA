@@ -1,6 +1,7 @@
 #pragma once
 #include <cosma/memory_pool.hpp>
 #include <cosma/strategy.hpp>
+#include <cosma/bfloat16.hpp>
 #include <iostream>
 #include <memory>
 
@@ -15,6 +16,7 @@ namespace cosma {
 
 // forward-declaration
 class communicator;
+class sfc_gemm_cache;
 
 template <typename Scalar>
 class cosma_context {
@@ -37,6 +39,10 @@ class cosma_context {
     cosma::communicator *get_cosma_comm();
 
     long long get_cpu_memory_limit();
+
+#ifdef COSMA_WITH_SFC_GEMM
+    sfc_gemm_cache *get_sfc_gemm_cache();
+#endif
 
     void turn_on_output();
 
@@ -63,6 +69,9 @@ class cosma_context {
     bool use_unified_memory_ = false;
     Strategy prev_strategy;
     std::unique_ptr<cosma::communicator> prev_cosma_comm;
+#ifdef COSMA_WITH_SFC_GEMM
+    std::unique_ptr<sfc_gemm_cache> sfc_cache_;
+#endif
 };
 
 template <typename Scalar>

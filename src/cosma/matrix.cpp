@@ -1,4 +1,5 @@
 #include <cosma/matrix.hpp>
+#include <cosma/bfloat16.hpp>
 #include <mpi.h>
 
 #include <complex>
@@ -474,5 +475,6 @@ template class CosmaMatrix<float>;
 template class CosmaMatrix<double>;
 template class CosmaMatrix<std::complex<float>>;
 template class CosmaMatrix<std::complex<double>>;
+template class CosmaMatrix<cosma::bfloat16>;
 
 } // namespace cosma

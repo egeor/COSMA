@@ -3,6 +3,7 @@
 #include <cosma/local_multiply.hpp>
 #include <cosma/math_utils.hpp>
 #include <cosma/mpi_mapper.hpp>
+#include <cosma/bfloat16.hpp>
 #include <cosma/profiler.hpp>
 
 #include <algorithm>
@@ -152,7 +153,7 @@ void reduce(MPI_Comm comm,
                            rank_offset[i],
                            b_size,
                            mpi_type,
-                           MPI_SUM,
+                           mpi_mapper<Scalar>::getSumOp(),
                            win);
 
             displacement += b_size;
@@ -706,7 +707,7 @@ void comm_task_k_split(int divisor,
                            0,
                            b_size,
                            mpi_type,
-                           MPI_SUM,
+                           mpi_mapper<Scalar>::getSumOp(),
                            win);
             MPI_Win_unlock(idx, win);
             PL();
@@ -1142,6 +1143,22 @@ template void overlap_comm_and_comp<std::complex<double>>(
     size_t step,
     std::complex<double> alpha,
     std::complex<double> beta);
+
+template void overlap_comm_and_comp<cosma::bfloat16>(
+    cosma_context<cosma::bfloat16> *ctx,
+    MPI_Comm comm,
+    int rank,
+    const Strategy strategy,
+    CosmaMatrix<cosma::bfloat16> &matrixA,
+    CosmaMatrix<cosma::bfloat16> &matrixB,
+    CosmaMatrix<cosma::bfloat16> &matrixC,
+    Interval &m,
+    Interval &n,
+    Interval &k,
+    Interval &P,
+    size_t step,
+    cosma::bfloat16 alpha,
+    cosma::bfloat16 beta);
 
 } // end namespace one_sided_communicator
 

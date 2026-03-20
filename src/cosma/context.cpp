@@ -5,6 +5,9 @@
 #include <cosma/communicator.hpp>
 #include <cosma/environment_variables.hpp>
 #include <cosma/profiler.hpp>
+#ifdef COSMA_WITH_SFC_GEMM
+#include <cosma/sfc_gemm_wrapper.hpp>
+#endif
 
 namespace cosma {
 #ifdef COSMA_HAVE_GPU
@@ -70,6 +73,16 @@ template <typename Scalar>
 long long cosma_context<Scalar>::get_cpu_memory_limit() {
     return cpu_memory_limit;
 }
+
+#ifdef COSMA_WITH_SFC_GEMM
+template <typename Scalar>
+sfc_gemm_cache *cosma_context<Scalar>::get_sfc_gemm_cache() {
+    if (!sfc_cache_) {
+        sfc_cache_ = std::make_unique<sfc_gemm_cache>(blocked_layout_desc{32, 32, 32});
+    }
+    return sfc_cache_.get();
+}
+#endif
 
 template <typename Scalar>
 cosma::communicator *cosma_context<Scalar>::get_cosma_comm() {
@@ -159,18 +172,21 @@ global_context<Scalar> get_context_instance() {
 
 using zfloat = std::complex<float>;
 using zdouble = std::complex<double>;
+using bf16_t = cosma::bfloat16;
 
 // template instantiation for cosma_context
 template class cosma_context<float>;
 template class cosma_context<double>;
 template class cosma_context<zfloat>;
 template class cosma_context<zdouble>;
+template class cosma_context<bf16_t>;
 
 // template instantiation for make_context
 template context<float> make_context();
 template context<double> make_context();
 template context<zfloat> make_context();
 template context<zdouble> make_context();
+template context<bf16_t> make_context();
 
 template context<float> make_context(size_t cpu_mem_limit,
                                      int streams,
@@ -192,10 +208,16 @@ template context<zdouble> make_context(size_t cpu_mem_limit,
                                        int tile_m,
                                        int tile_n,
                                        int tile_k);
+template context<bf16_t> make_context(size_t cpu_mem_limit,
+                                     int streams,
+                                     int tile_m,
+                                     int tile_n,
+                                     int tile_k);
 
 // template instantiation for get_context_instance
 template global_context<float> get_context_instance();
 template global_context<double> get_context_instance();
 template global_context<zfloat> get_context_instance();
 template global_context<zdouble> get_context_instance();
+template global_context<bf16_t> get_context_instance();
 } // namespace cosma

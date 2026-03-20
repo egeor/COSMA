@@ -137,3 +137,7 @@ template long long cosma::get_cpu_max_memory<float>();
 template long long cosma::get_cpu_max_memory<double>();
 template long long cosma::get_cpu_max_memory<std::complex<float>>();
 template long long cosma::get_cpu_max_memory<std::complex<double>>();
+#ifdef COSMA_WITH_SFC_GEMM
+#include <cosma/bfloat16.hpp>
+template long long cosma::get_cpu_max_memory<cosma::bfloat16>();
+#endif

@@ -28,6 +28,7 @@ option(COSMA_WITH_NCCL "Use NCCL as communication backend." OFF)
 option(COSMA_WITH_RCCL "Use RCCL as communication backend." OFF)
 option(COSMA_WITH_GPU_AWARE_MPI "Use gpu-aware MPI for communication." OFF)
 option(COSMA_USE_UNIFIED_MEMORY "Use unified memory when GPU acceleration is ON" OFF)
+option(COSMA_WITH_SFC_GEMM "Enable BFloat16 GEMM via sfc_ca_gemm (requires libxsmm)" OFF)
 option(BUILD_SHARED_LIBS "Build shared libraries." OFF)
 set(COSMA_SCALAPACK "OFF" CACHE STRING "scalapack implementation. Can be MKL, CRAY_LIBSCI, NVPL, CUSTOM or OFF.")
 set(COSMA_BLAS "OFF" CACHE STRING "Blas library for computations on host or GPU")
@@ -102,8 +103,8 @@ set(COSTA_SCALAPACK ${COSMA_SCALAPACK} CACHE INTERNAL "")
 
 FetchContent_Declare(
   costa
-  GIT_REPOSITORY https://github.com/eth-cscs/costa.git
-  GIT_TAG        2484769535772f807d402901ffca63bb6678dd42 # v2.3.0
+  GIT_REPOSITORY https://github.com/egeor/COSTA.git
+  GIT_TAG        28c3e69 # feature/bf16-support (v2.3.0 + bf16 instantiations)
   FIND_PACKAGE_ARGS NAMES costa
 )
 
@@ -114,6 +115,14 @@ if (NOT TARGET costa::scalapack::scalapack AND NOT COSMA_SCALAPACK MATCHES "OFF"
 endif ()
 
 FetchContent_MakeAvailable(costa)
+
+# Propagate bf16 support flags to COSTA so it can instantiate templates
+if (COSMA_WITH_SFC_GEMM)
+  if (TARGET costa)
+    target_compile_definitions(costa PRIVATE COSMA_WITH_SFC_GEMM)
+    target_include_directories(costa PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  endif()
+endif()
 
 # these are only GPU-backends
 if (COSMA_GPU_BACKEND MATCHES "CUDA|ROCM")
@@ -149,6 +158,85 @@ if (COSMA_WITH_PROFILING)
   )
   FetchContent_MakeAvailable(semiprof)
 endif ()
+
+# sfc_ca_gemm / libxsmm for BFloat16 blocked GEMM
+if (COSMA_WITH_SFC_GEMM)
+  # libxsmm is required for sfc_ca_gemm TPP kernels
+  # Try to find an existing installation first
+  set(LIBXSMM_FOUND FALSE)
+  find_package(PkgConfig)
+  if (PkgConfig_FOUND)
+    pkg_check_modules(LIBXSMM IMPORTED_TARGET libxsmm)
+  endif()
+  if (NOT LIBXSMM_FOUND)
+    # Accept both cmake variable (-DLIBXSMM_ROOT=...) and env variable
+    set(LIBXSMM_ROOT "" CACHE PATH "Root directory of libxsmm installation")
+    find_library(LIBXSMM_LIBRARY NAMES xsmm libxsmm
+      HINTS ${LIBXSMM_ROOT}/lib ENV LIBXSMM_ROOT
+      PATH_SUFFIXES lib lib64)
+    find_path(LIBXSMM_INCLUDE_DIR NAMES libxsmm.h
+      HINTS ${LIBXSMM_ROOT}/include ENV LIBXSMM_ROOT
+      PATH_SUFFIXES include)
+    if (LIBXSMM_LIBRARY AND LIBXSMM_INCLUDE_DIR)
+      add_library(libxsmm::libxsmm UNKNOWN IMPORTED)
+      set_target_properties(libxsmm::libxsmm PROPERTIES
+        IMPORTED_LOCATION "${LIBXSMM_LIBRARY}"
+        INTERFACE_INCLUDE_DIRECTORIES "${LIBXSMM_INCLUDE_DIR}")
+      set(LIBXSMM_FOUND TRUE)
+    endif()
+  endif()
+  if (NOT LIBXSMM_FOUND)
+    # Auto-fetch and build libxsmm from source
+    message(STATUS "libxsmm not found — fetching from GitHub")
+    FetchContent_Declare(
+      libxsmm
+      GIT_REPOSITORY https://github.com/libxsmm/libxsmm.git
+      GIT_TAG        c14cbc6f8 # main as of 2026-03-20
+      EXCLUDE_FROM_ALL
+    )
+    set(XSMM_STATIC ON CACHE INTERNAL "")
+    FetchContent_MakeAvailable(libxsmm)
+    # libxsmm's Makefile generates libxsmm_version.h; CMake doesn't.
+    # Generate it from the template if missing.
+    if (NOT EXISTS "${libxsmm_SOURCE_DIR}/include/libxsmm_version.h")
+      file(READ "${libxsmm_SOURCE_DIR}/src/template/libxsmm_version.h" _ver_tmpl)
+      string(REPLACE "\$VERSION" "1.17-dev" _ver_tmpl "${_ver_tmpl}")
+      string(REPLACE "\$BRANCH"  "main"     _ver_tmpl "${_ver_tmpl}")
+      string(REPLACE "\$MAJOR"   "1"        _ver_tmpl "${_ver_tmpl}")
+      string(REPLACE "\$MINOR"   "17"       _ver_tmpl "${_ver_tmpl}")
+      string(REPLACE "\$UPDATE"  "0"        _ver_tmpl "${_ver_tmpl}")
+      string(REPLACE "\$PATCH"   "0"        _ver_tmpl "${_ver_tmpl}")
+      string(TIMESTAMP _date "%Y%m%d")
+      string(REPLACE "\$DATE"    "${_date}" _ver_tmpl "${_ver_tmpl}")
+      file(WRITE "${libxsmm_SOURCE_DIR}/include/libxsmm_version.h" "${_ver_tmpl}")
+      message(STATUS "Generated libxsmm_version.h")
+    endif()
+    # The libxsmm CMake creates target "xsmm" with PUBLIC include dirs
+    # that use absolute paths. Override with proper generator expressions
+    # so cosma's install export doesn't fail.
+    if (TARGET xsmm)
+      set_target_properties(xsmm PROPERTIES
+        INTERFACE_INCLUDE_DIRECTORIES
+        "$<BUILD_INTERFACE:${libxsmm_SOURCE_DIR}/include>")
+      if (NOT TARGET libxsmm::libxsmm)
+        add_library(libxsmm::libxsmm ALIAS xsmm)
+      endif()
+    endif()
+    set(LIBXSMM_FOUND TRUE)
+  endif()
+  # sfc_ca_gemm headers (default: bundled under libs/sfc_ca_gemm)
+  set(SFC_CA_GEMM_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/libs/sfc_ca_gemm" CACHE PATH
+    "Path to sfc_ca_gemm headers (directory containing sfc_ca_gemm.hpp)")
+  if (NOT EXISTS "${SFC_CA_GEMM_INCLUDE_DIR}/sfc_ca_gemm.hpp")
+    message(FATAL_ERROR "COSMA_WITH_SFC_GEMM=ON but sfc_ca_gemm.hpp not found in "
+      "${SFC_CA_GEMM_INCLUDE_DIR}. Set -DSFC_CA_GEMM_INCLUDE_DIR=...")
+  endif()
+  if (NOT EXISTS "${SFC_CA_GEMM_INCLUDE_DIR}/sfc_ca_gemm.cpp")
+    message(FATAL_ERROR "SFC_CA_GEMM_INCLUDE_DIR must also contain sfc_ca_gemm.cpp "
+      "(run_gemm template is defined there).")
+  endif()
+  message(STATUS "sfc_ca_gemm headers: ${SFC_CA_GEMM_INCLUDE_DIR}")
+endif()
 
 if (COSMA_WITH_TESTS OR COSMA_WITH_APPS)
   FetchContent_Declare(

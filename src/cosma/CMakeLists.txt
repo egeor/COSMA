@@ -22,6 +22,11 @@ if (COSMA_GPU_BACKEND MATCHES "OFF")
 	LIST(APPEND cosma_src_files blas.cpp)
 endif ()
 
+if (COSMA_WITH_SFC_GEMM)
+  LIST(APPEND cosma_src_files sfc_gemm_wrapper.cpp)
+  LIST(APPEND cosma_src_files bf16_instantiations.cpp)
+endif ()
+
 if (COSMA_GPU_BACKEND MATCHES "ROCM" OR COSMA_GPU_BACKEND MATCHES "CUDA")
   list(APPEND cosma_src_files "pinned_buffers.cpp")
   if (COSMA_WITH_NCCL OR COSMA_WITH_RCCL)
@@ -37,6 +42,30 @@ add_library(cosma ${cosma_src_files})
 target_include_directories(cosma PUBLIC
   $<BUILD_INTERFACE:${cosma_SOURCE_DIR}/src>
 )
+
+# sfc_ca_gemm / libxsmm includes and linkage
+if (COSMA_WITH_SFC_GEMM)
+  target_include_directories(cosma PRIVATE "${SFC_CA_GEMM_INCLUDE_DIR}")
+  if (TARGET PkgConfig::LIBXSMM)
+    target_link_libraries(cosma PRIVATE PkgConfig::LIBXSMM)
+  elseif (TARGET libxsmm::libxsmm)
+    # When libxsmm is fetched via FetchContent, link by file path
+    # to avoid polluting the install export set.
+    if (TARGET xsmm)
+      target_include_directories(cosma PRIVATE
+        $<TARGET_PROPERTY:xsmm,INTERFACE_INCLUDE_DIRECTORIES>)
+      target_link_libraries(cosma PRIVATE $<TARGET_FILE:xsmm>)
+      # Ensure xsmm is built before cosma
+      add_dependencies(cosma xsmm)
+    else()
+      target_link_libraries(cosma PRIVATE libxsmm::libxsmm)
+    endif()
+  endif()
+  find_package(OpenMP COMPONENTS CXX)
+  if (OpenMP_CXX_FOUND)
+    target_link_libraries(cosma PRIVATE OpenMP::OpenMP_CXX)
+  endif()
+endif()
 
 target_compile_features(cosma PUBLIC cxx_std_14)
 target_link_libraries(cosma PUBLIC
@@ -62,6 +91,7 @@ target_compile_definitions(cosma PUBLIC
                               $<$<NOT:$<IN_LIST:${COSMA_BLAS_VENDOR},"MKL;BLISi;OFF">>:COSMA_WITH_BLAS>
                               $<$<STREQUAL:${COSMA_GPU_BACKEND},CUDA>:COSMA_HAVE_GPU>
                               $<$<STREQUAL:${COSMA_GPU_BACKEND},ROCM>:COSMA_HAVE_GPU>
+                              $<$<BOOL:${COSMA_WITH_SFC_GEMM}>:COSMA_WITH_SFC_GEMM>
                               PRIVATE
                               $<$<BOOL:${COSMA_WITH_PROFILING}>:COSMA_WITH_PROFILING>)
 

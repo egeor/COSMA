@@ -1,5 +1,6 @@
 #include <complex>
 
+#include <cosma/bfloat16.hpp>
 #include <cosma/communicator.hpp>
 #include <cosma/one_sided_communicator.hpp>
 #include <cosma/two_sided_communicator.hpp>
@@ -487,6 +488,16 @@ template void communicator::copy<std::complex<double>>(
     int total_after,
     int step);
 
+template void
+communicator::copy<cosma::bfloat16>(Interval &P,
+                          cosma::bfloat16 *in,
+                          cosma::bfloat16 *out,
+                          cosma::bfloat16 *reshuffle_buffer,
+                          std::vector<std::vector<int>> &size_before,
+                          std::vector<int> &total_before,
+                          int total_after,
+                          int step);
+
 // Explicit instantiations for `reduce`
 //
 template void
@@ -545,6 +556,20 @@ template void communicator::reduce<std::complex<double>>(
     std::complex<double> beta,
     int step);
 
+template void
+communicator::reduce<cosma::bfloat16>(Interval &P,
+                            cosma::bfloat16 *in,
+                            cosma::bfloat16 *out,
+                            cosma::bfloat16 *reshuffle_buffer,
+                            cosma::bfloat16 *reduce_buffer,
+                            std::vector<std::vector<int>> &c_current,
+                            std::vector<int> &c_total_current,
+                            std::vector<std::vector<int>> &c_expanded,
+                            std::vector<int> &c_total_expanded,
+                            cosma::bfloat16 alpha,
+                            cosma::bfloat16 beta,
+                            int step);
+
 // Explicit instantiations for `overlap_comm_and_comp`
 //
 template void
@@ -597,5 +622,19 @@ template void communicator::overlap_comm_and_comp<std::complex<double>>(
     size_t step,
     std::complex<double> alpha,
     std::complex<double> beta);
+
+template void
+communicator::overlap_comm_and_comp<cosma::bfloat16>(
+    cosma_context<cosma::bfloat16> *ctx,
+    CosmaMatrix<cosma::bfloat16> &matrixA,
+    CosmaMatrix<cosma::bfloat16> &matrixB,
+    CosmaMatrix<cosma::bfloat16> &matrixC,
+    Interval &m,
+    Interval &n,
+    Interval &k,
+    Interval &P,
+    size_t step,
+    cosma::bfloat16 alpha,
+    cosma::bfloat16 beta);
 
 } // namespace cosma
