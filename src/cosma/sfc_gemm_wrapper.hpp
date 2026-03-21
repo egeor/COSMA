@@ -74,7 +74,7 @@ public:
     size_t          last_B_sz()  const { return last_B_sz_; }
     void set_last_A(const bfloat16 *p, size_t n) { last_A_ptr_ = p; last_A_sz_ = n; }
     void set_last_B(const bfloat16 *p, size_t n) { last_B_ptr_ = p; last_B_sz_ = n; }
-    void reset_pack_cache() { last_A_ptr_ = nullptr; last_B_ptr_ = nullptr; a_reshuffled_ = false; }
+    void reset_pack_cache() { last_A_ptr_ = nullptr; last_B_ptr_ = nullptr; }
 
     /// Pre-packed mode: when set, gemm() skips pack/unpack and operates
     /// directly on blocked-layout data.  The caller must ensure:
@@ -91,19 +91,6 @@ public:
     /// B and C stay in native blocked layout (no reshuffle needed).
     void set_blocked_comm(bool v) { blocked_comm_ = v; }
     bool is_blocked_comm() const { return blocked_comm_; }
-
-    /// Reshuffle mode for blocked-comm A:
-    ///   0 = reshuffle at each leaf GEMM call (simple, always correct)
-    ///   1 = reshuffle right after allgather / per arriving chunk
-    ///       (overlap-friendly: compute thread sees M-outer A directly)
-    /// Controlled by COSMA_BF16_RESHUFFLE_MODE env var.
-    void set_reshuffle_mode(int v) { reshuffle_mode_ = v; }
-    int  reshuffle_mode() const { return reshuffle_mode_; }
-
-    /// Track whether A has been reshuffled to M-outer by the
-    /// communication layer (mode 1).  Reset before each multiply.
-    void set_a_reshuffled(bool v) { a_reshuffled_ = v; }
-    bool is_a_reshuffled() const { return a_reshuffled_; }
 
 private:
     blocked_layout_desc desc_;
@@ -124,8 +111,6 @@ private:
     size_t          last_B_sz_  = 0;
     bool            prepacked_  = false;
     bool            blocked_comm_ = false;
-    int             reshuffle_mode_ = 0;
-    bool            a_reshuffled_ = false;
 };
 
 /// Pack a column-major M*K matrix (A) into blocked VNNI format

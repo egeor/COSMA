@@ -10,7 +10,7 @@
 #include <costa/grid2grid/transformer.hpp>
 
 #include <complex>
-#include <type_traits>
+
 
 #if defined(COSMA_HAVE_GPU) && defined(COSMA_WITH_NCCL)
 #include <cosma/gpu/nccl_utils.hpp>
@@ -263,13 +263,6 @@ void multiply(cosma_context<Scalar> *ctx,
     if (comm == MPI_COMM_NULL || ctx->get_cosma_comm()->is_idle()) {
 	return;
     }
-
-#ifdef COSMA_WITH_SFC_GEMM
-    // Reset per-multiply reshuffle tracking for blocked-comm mode
-    if constexpr (std::is_same_v<Scalar, cosma::bfloat16>) {
-        get_sfc_gemm_cache().set_a_reshuffled(false);
-    }
-#endif
 
     Interval mi = Interval(0, strategy.m - 1);
     Interval ni = Interval(0, strategy.n - 1);
@@ -796,32 +789,6 @@ void parallel(cosma_context<Scalar> *ctx,
                   step);
 #endif
 
-#ifdef COSMA_WITH_SFC_GEMM
-        // In blocked-comm mode with reshuffle_mode==1, reshuffle A from
-        // K-outer [Kb][Mb][tile] to M-outer [Mb][Kb][tile] right after
-        // allgather so that the compute thread sees M-outer A directly.
-        // Only applies when A is the expanded matrix (split_n step).
-        if constexpr (std::is_same_v<Scalar, cosma::bfloat16>) {
-            auto &cache = get_sfc_gemm_cache();
-            if (cache.is_blocked_comm() && cache.reshuffle_mode() == 1
-                && strategy.split_n(step)) {
-                auto desc = cache.block_desc();
-                int bm = desc.bm, bk = desc.bk;
-                int M_local = m.length();
-                int K_local = k.length();
-                while (M_local % bm != 0 && bm > 1) --bm;
-                while (K_local % bk != 0 && bk > 1) --bk;
-                // Use scratch_A as temporary; copy back in-place.
-                auto *scratch = cache.scratch_A((size_t)M_local * K_local);
-                reshuffle_A_Kouter_to_Mouter(
-                    reinterpret_cast<const cosma::bfloat16 *>(expanded_matrix),
-                    scratch, M_local, K_local, bm, bk);
-                std::memcpy(expanded_matrix, scratch,
-                            (size_t)M_local * K_local * sizeof(cosma::bfloat16));
-                cache.set_a_reshuffled(true);
-            }
-        }
-#endif
     }
 
     // if division by k, and we are in the branch where beta > 0, then

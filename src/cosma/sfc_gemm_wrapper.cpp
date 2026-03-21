@@ -12,7 +12,6 @@
 #include <sfc_ca_gemm.cpp>
 
 #include <cosma/sfc_gemm_wrapper.hpp>
-#include <cosma/environment_variables.hpp>
 
 #include <cassert>
 #include <cstdio>
@@ -322,11 +321,7 @@ void run_sfc_gemm(void *config_opaque,
 // double-free those pointers.  The OS reclaims everything at exit.
 static sfc_gemm_cache &singleton_cache() {
     static blocked_layout_desc desc{32, 32, 32, 2, 3};
-    static auto *cache = []() {
-        auto *c = new sfc_gemm_cache(desc);
-        c->set_reshuffle_mode(get_bf16_reshuffle_mode());
-        return c;
-    }();
+    static auto *cache = new sfc_gemm_cache(desc);
     return *cache;
 }
 

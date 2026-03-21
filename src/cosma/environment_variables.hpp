@@ -20,10 +20,7 @@ const std::string gpu_tile_k = "COSMA_GPU_MAX_TILE_K";
 const std::string adapt_strategy = "COSMA_ADAPT_STRATEGY";
 // if ON, COSMA will try to overlap communication and computation
 const std::string overlap = "COSMA_OVERLAP_COMM_AND_COMP";
-// BF16 blocked-comm A reshuffle mode:
-//   0 = reshuffle at leaf GEMM (default)
-//   1 = reshuffle after allgather / per arriving chunk (overlap-friendly)
-const std::string bf16_reshuffle_mode = "COSMA_BF16_RESHUFFLE_MODE";
+
 // specifies the maximum available CPU memory per rank in MB
 const std::string cpu_max_memory = "COSMA_CPU_MAX_MEMORY";
 // if true, local host matrices will be pinned
@@ -69,8 +66,7 @@ const int gpu_tile_k = 5000;
 const bool adapt_strategy = true;
 // if ON, COSMA will try to overlap communication and computation
 const bool overlap = false;
-// BF16 blocked-comm A reshuffle mode: 0 = at leaf, 1 = after allgather
-const int bf16_reshuffle_mode = 0;
+
 // specifies the maximum available CPU memory per rank in MB
 const long long cpu_max_memory = std::numeric_limits<long long>::max(); // inf
 // if true, local host matrices will be pinned
@@ -149,10 +145,7 @@ bool get_adapt_strategy();
 // the default value if the variable is undefined
 bool get_overlap_comm_and_comp();
 
-// reads the environment variable selecting the BF16 A-reshuffle mode.
-// 0 = reshuffle K-outer→M-outer at each leaf GEMM (simple, always correct)
-// 1 = reshuffle right after allgather/chunk arrival (overlaps with comm)
-int get_bf16_reshuffle_mode();
+
 
 // reads the memory pool amortization (>= 1.0).
 // If amortization = 1.2, then the memory allocator

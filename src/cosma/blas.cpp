@@ -203,21 +203,15 @@ void gemm(const int M,
     if (cache.is_blocked_comm()) {
         // --- Blocked-comm mode: all matrices in blocked layout ---
         // A: K-outer VNNI [Kb][Mb][bk/2][bm][2]  (MPI comm format)
-        //    or M-outer if reshuffle_mode==1 (already reshuffled)
         // B: [Nb][Kb][bn][bk]                     (kernel native format)
         // C: [Nb][Mb][bn][bm]                     (kernel native format)
         const float fb = float(beta);
         const size_t a_sz = (size_t)M * K;
         const size_t c_sz = (size_t)M * N;
 
-        // Determine the A pointer for the kernel (always M-outer, a_k_outer=0)
-        bfloat16 *A_for_kernel;
-        if (cache.is_a_reshuffled()) {
-            // A already reshuffled to M-outer by multiply/overlap layer
-            A_for_kernel = const_cast<bfloat16 *>(A);
-        } else {
-            // Mode 0: reshuffle A from K-outer to M-outer here
-            A_for_kernel = cache.scratch_A(a_sz);
+        // Reshuffle A from K-outer to M-outer for the kernel (a_k_outer=0)
+        bfloat16 *A_for_kernel = cache.scratch_A(a_sz);
+        {
             auto t0 = clk::now();
             reshuffle_A_Kouter_to_Mouter(A, A_for_kernel, M, K, bm, bk);
             auto t1 = clk::now();

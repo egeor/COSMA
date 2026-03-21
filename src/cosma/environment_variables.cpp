@@ -85,11 +85,6 @@ bool cosma::get_overlap_comm_and_comp() {
     return get_bool_env_var(env_var_names::overlap, env_var_defaults::overlap);
 }
 
-int cosma::get_bf16_reshuffle_mode() {
-    return get_int_env_var(env_var_names::bf16_reshuffle_mode,
-                          env_var_defaults::bf16_reshuffle_mode);
-}
-
 bool cosma::get_memory_pinning() {
     return get_bool_env_var(env_var_names::memory_pinning_enabled,
                             env_var_defaults::memory_pinning_enabled);

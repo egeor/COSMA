@@ -390,11 +390,7 @@ int main(int argc, char **argv) {
         }
 
         cosma::get_sfc_gemm_cache().set_blocked_comm(true);
-        int rmode = cosma::get_sfc_gemm_cache().reshuffle_mode();
-        if (rmode == 1)
-            mode_label = "BLOCKED_COMM (K-outer A, reshuffle=post-allgather)";
-        else
-            mode_label = "BLOCKED_COMM (K-outer A, reshuffle=leaf-gemm)";
+        mode_label = "BLOCKED_COMM (K-outer A, leaf reshuffle)";
     }
 
     // 2) Run COSMA multiply (correctness — exercises actual mode)
