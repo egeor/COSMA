@@ -3,10 +3,14 @@
 #include <cosma/multiply.hpp>
 #include <cosma/bfloat16.hpp>
 #include <cosma/profiler.hpp>
+#ifdef COSMA_WITH_SFC_GEMM
+#include <cosma/sfc_gemm_wrapper.hpp>
+#endif
 #include <costa/grid2grid/ranks_reordering.hpp>
 #include <costa/grid2grid/transformer.hpp>
 
 #include <complex>
+#include <type_traits>
 
 #if defined(COSMA_HAVE_GPU) && defined(COSMA_WITH_NCCL)
 #include <cosma/gpu/nccl_utils.hpp>
@@ -783,6 +787,32 @@ void parallel(cosma_context<Scalar> *ctx,
                   total_before_expansion,
                   new_size,
                   step);
+#endif
+
+#ifdef COSMA_WITH_SFC_GEMM
+        // In blocked-comm mode with reshuffle_mode==1, reshuffle A from
+        // K-outer [Kb][Mb][tile] to M-outer [Mb][Kb][tile] right after
+        // allgather so that the compute thread sees M-outer A directly.
+        // Only applies when A is the expanded matrix (split_n step).
+        if constexpr (std::is_same_v<Scalar, cosma::bfloat16>) {
+            auto &cache = get_sfc_gemm_cache();
+            if (cache.is_blocked_comm() && cache.reshuffle_mode() == 1
+                && strategy.split_n(step)) {
+                auto desc = cache.block_desc();
+                int bm = desc.bm, bk = desc.bk;
+                int M_local = m.length();
+                int K_local = k.length();
+                while (M_local % bm != 0 && bm > 1) --bm;
+                while (K_local % bk != 0 && bk > 1) --bk;
+                // Use scratch_A as temporary; copy back in-place.
+                auto *scratch = cache.scratch_A((size_t)M_local * K_local);
+                reshuffle_A_Kouter_to_Mouter(
+                    reinterpret_cast<const cosma::bfloat16 *>(expanded_matrix),
+                    scratch, M_local, K_local, bm, bk);
+                std::memcpy(expanded_matrix, scratch,
+                            (size_t)M_local * K_local * sizeof(cosma::bfloat16));
+            }
+        }
 #endif
     }
 

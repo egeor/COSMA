@@ -5,6 +5,9 @@
 #include <cosma/mpi_mapper.hpp>
 #include <cosma/bfloat16.hpp>
 #include <cosma/profiler.hpp>
+#ifdef COSMA_WITH_SFC_GEMM
+#include <cosma/sfc_gemm_wrapper.hpp>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -18,6 +21,7 @@
 #include <stdlib.h>
 #include <thread>
 #include <tuple>
+#include <type_traits>
 #include <vector>
 
 namespace cosma {
@@ -612,6 +616,29 @@ void overlap_n_split(bool use_busy_waiting,
                 dist == 0
                     ? original_matrix
                     : (expanded_matrix + m.length() * displacements_k[idx]);
+
+#ifdef COSMA_WITH_SFC_GEMM
+            // In blocked-comm mode with reshuffle_mode==1, reshuffle this
+            // A chunk from K-outer to M-outer before local_multiply, so
+            // the compute side sees M-outer A directly (no leaf reshuffle).
+            if constexpr (std::is_same_v<Scalar, cosma::bfloat16>) {
+                auto &cache = cosma::get_sfc_gemm_cache();
+                if (cache.is_blocked_comm() && cache.reshuffle_mode() == 1) {
+                    auto desc = cache.block_desc();
+                    int bm = desc.bm, bk = desc.bk;
+                    int M_local = m.length();
+                    int K_chunk = k.subinterval(divisor, idx).length();
+                    while (M_local % bm != 0 && bm > 1) --bm;
+                    while (K_chunk % bk != 0 && bk > 1) --bk;
+                    auto *scratch = cache.scratch_A((size_t)M_local * K_chunk);
+                    cosma::reshuffle_A_Kouter_to_Mouter(
+                        reinterpret_cast<const cosma::bfloat16 *>(pointer_a),
+                        scratch, M_local, K_chunk, bm, bk);
+                    std::memcpy(pointer_a, scratch,
+                                (size_t)M_local * K_chunk * sizeof(Scalar));
+                }
+            }
+#endif
             // Scalar* pointer_b = switch_buffers ? buffer2.data() :
             // buffer1.data();
             Scalar *pointer_b = block_buffer.data();

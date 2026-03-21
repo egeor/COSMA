@@ -14,8 +14,8 @@ struct blocked_layout_desc {
     int bm = 32;
     int bn = 32;
     int bk = 32;
-    long kbf = 1;
-    long K_layers = 1;
+    long kbf = 2;
+    long K_layers = 3;
 };
 
 /// Accumulated timing breakdown for bf16 GEMM phases.
@@ -76,9 +76,33 @@ public:
     void set_last_B(const bfloat16 *p, size_t n) { last_B_ptr_ = p; last_B_sz_ = n; }
     void reset_pack_cache() { last_A_ptr_ = nullptr; last_B_ptr_ = nullptr; }
 
+    /// Pre-packed mode: when set, gemm() skips pack/unpack and operates
+    /// directly on blocked-layout data.  The caller must ensure:
+    ///   A is in VNNI format [Mb][Kb][bk/2][bm][2]
+    ///   B is in blocked format [Nb][Kb][bn][bk]
+    ///   C is in blocked format [Nb][Mb][bn][bm] (output)
+    /// Set before calling multiply(), clear after.
+    void set_prepacked(bool v) { prepacked_ = v; }
+    bool is_prepacked() const { return prepacked_; }
+
+    /// Blocked-comm mode: entire COSMA pipeline operates in blocked layout.
+    /// A is in K-outer VNNI [Kb][Mb][bk/2][bm][2] for MPI comm compatibility.
+    /// Before each leaf GEMM, A tiles are reshuffled to M-outer [Mb][Kb][...].
+    /// B and C stay in native blocked layout (no reshuffle needed).
+    void set_blocked_comm(bool v) { blocked_comm_ = v; }
+    bool is_blocked_comm() const { return blocked_comm_; }
+
+    /// Reshuffle mode for blocked-comm A:
+    ///   0 = reshuffle at each leaf GEMM call (simple, always correct)
+    ///   1 = reshuffle right after allgather / per arriving chunk
+    ///       (overlap-friendly: compute thread sees M-outer A directly)
+    /// Controlled by COSMA_BF16_RESHUFFLE_MODE env var.
+    void set_reshuffle_mode(int v) { reshuffle_mode_ = v; }
+    int  reshuffle_mode() const { return reshuffle_mode_; }
+
 private:
     blocked_layout_desc desc_;
-    using key_t = std::tuple<int, int, int>;
+    using key_t = std::tuple<int, int, int, int>;  // (M, N, K, a_k_outer)
     std::map<key_t, void *> cache_;
 
     bfloat16 *buf_A_ = nullptr;
@@ -93,6 +117,9 @@ private:
     size_t          last_A_sz_  = 0;
     const bfloat16 *last_B_ptr_ = nullptr;
     size_t          last_B_sz_  = 0;
+    bool            prepacked_  = false;
+    bool            blocked_comm_ = false;
+    int             reshuffle_mode_ = 0;
 };
 
 /// Pack a column-major M*K matrix (A) into blocked VNNI format
@@ -114,6 +141,23 @@ void pack_C_to_blocked(const bfloat16 *src, bfloat16 *dst,
 /// Unpack blocked C [Nb][Mb][bn][bm] back to column-major M*N.
 void unpack_C_from_blocked(const bfloat16 *src, bfloat16 *dst,
                            int M, int N, int bm, int bn);
+
+/// Pack a column-major M*K matrix (A) into K-outer blocked VNNI format
+/// [Kb][Mb][bk/2][bm][2] for bf16.
+///
+/// K outermost makes the layout compatible with COSMA's flat-array operations:
+/// - allgather expanding K: concat at end -> valid [Kb_full][Mb][...]
+/// - K-split pointer offset: contiguous K-slice
+/// The sfc_ca_gemm kernel directly supports K-outer A (a_k_outer=1).
+void pack_A_to_blocked_vnni_Kouter(const bfloat16 *src, bfloat16 *dst,
+                                   int M, int K, int bm, int bk);
+
+/// Reshuffle A tiles from K-outer [Kb][Mb][tile] to M-outer [Mb][Kb][tile].
+/// Each tile (bm*bk elements) is copied intact — only the tile-level
+/// (Kb, Mb) indices are transposed.  This makes A ready for the kernel
+/// (a_k_outer=0) after MPI communication used K-outer layout.
+void reshuffle_A_Kouter_to_Mouter(const bfloat16 *src, bfloat16 *dst,
+                                  int M, int K, int bm, int bk);
 
 /// Run the local bf16 GEMM via sfc_ca_gemm on already-blocked data.
 ///   A: blocked VNNI [Mb][Kb][bk/2][bm][2]  (M*K elements)

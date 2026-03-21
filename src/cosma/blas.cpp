@@ -151,8 +151,6 @@ void gemm(const int M,
           const bfloat16 beta,
           bfloat16 *C,
           const int ldc) {
-    // All scratch buffers are persistent in the singleton cache — allocated
-    // once and reused across calls.  Timing is accumulated per phase.
     using clk = std::chrono::high_resolution_clock;
 
     auto &cache = get_sfc_gemm_cache();
@@ -165,48 +163,121 @@ void gemm(const int M,
     while (N % bn != 0 && bn > 1) --bn;
     while (K % bk != 0 && bk > 1) --bk;
 
-    // --- Persistent scratch buffers (grow-only, never shrink) ---
+    if (cache.is_prepacked()) {
+        // --- Fully pre-packed mode: A, B, C all in blocked layout ---
+        // A: VNNI [Mb][Kb][bk/2][bm][2], B: [Nb][Kb][bn][bk], C: [Nb][Mb][bn][bm]
+        const float fb = float(beta);
+        const size_t c_sz = (size_t)M * N;
+
+        bfloat16 *C_save = nullptr;
+        if (fb != 0.0f) {
+            C_save = cache.scratch_C(c_sz);
+            auto t0s = clk::now();
+            std::memcpy(C_save, C, c_sz * sizeof(bfloat16));
+            auto t1s = clk::now();
+            tm.unpack_c += std::chrono::duration<double>(t1s - t0s).count();
+        }
+
+        auto t0 = clk::now();
+        void *cfg = cache.get_config(M, N, K);
+        run_sfc_gemm(cfg, const_cast<bfloat16 *>(A),
+                     const_cast<bfloat16 *>(B), C);
+        auto t1 = clk::now();
+        tm.compute += std::chrono::duration<double>(t1 - t0).count();
+
+        if (float(alpha) != 1.0f || fb != 0.0f) {
+            const float fa = float(alpha);
+            t0 = clk::now();
+            #pragma omp parallel for schedule(static)
+            for (size_t i = 0; i < c_sz; ++i) {
+                float val = fa * float(C[i]);
+                if (fb != 0.0f) val += fb * float(C_save[i]);
+                C[i] = bfloat16(val);
+            }
+            t1 = clk::now();
+            tm.unpack_c += std::chrono::duration<double>(t1 - t0).count();
+        }
+        return;
+    }
+
+    if (cache.is_blocked_comm()) {
+        // --- Blocked-comm mode: all matrices in blocked layout ---
+        // A: K-outer VNNI [Kb][Mb][bk/2][bm][2]  (MPI comm format)
+        //    or M-outer if reshuffle_mode==1 (already reshuffled)
+        // B: [Nb][Kb][bn][bk]                     (kernel native format)
+        // C: [Nb][Mb][bn][bm]                     (kernel native format)
+        const float fb = float(beta);
+        const size_t a_sz = (size_t)M * K;
+        const size_t c_sz = (size_t)M * N;
+
+        // Determine the A pointer for the kernel (always M-outer, a_k_outer=0)
+        bfloat16 *A_for_kernel;
+        if (cache.reshuffle_mode() == 1) {
+            // Mode 1: A already reshuffled to M-outer by multiply/overlap layer
+            A_for_kernel = const_cast<bfloat16 *>(A);
+        } else {
+            // Mode 0: reshuffle A from K-outer to M-outer here
+            A_for_kernel = cache.scratch_A(a_sz);
+            auto t0 = clk::now();
+            reshuffle_A_Kouter_to_Mouter(A, A_for_kernel, M, K, bm, bk);
+            auto t1 = clk::now();
+            tm.pack_a += std::chrono::duration<double>(t1 - t0).count();
+        }
+
+        // For beta != 0: save C_old (in blocked layout)
+        bfloat16 *C_save = nullptr;
+        if (fb != 0.0f) {
+            C_save = cache.scratch_C(c_sz);
+            auto t0s = clk::now();
+            std::memcpy(C_save, C, c_sz * sizeof(bfloat16));
+            auto t1s = clk::now();
+            tm.unpack_c += std::chrono::duration<double>(t1s - t0s).count();
+        }
+
+        auto t0 = clk::now();
+        void *cfg = cache.get_config(M, N, K);
+        run_sfc_gemm(cfg, A_for_kernel,
+                     const_cast<bfloat16 *>(B), C);
+        auto t1 = clk::now();
+        tm.compute += std::chrono::duration<double>(t1 - t0).count();
+
+        // For beta != 0: accumulate C = alpha * C_new + beta * C_old
+        if (float(alpha) != 1.0f || fb != 0.0f) {
+            const float fa = float(alpha);
+            t0 = clk::now();
+            #pragma omp parallel for schedule(static)
+            for (size_t i = 0; i < c_sz; ++i) {
+                float val = fa * float(C[i]);
+                if (fb != 0.0f) val += fb * float(C_save[i]);
+                C[i] = bfloat16(val);
+            }
+            t1 = clk::now();
+            tm.unpack_c += std::chrono::duration<double>(t1 - t0).count();
+        }
+        return;
+    }
+
+    // --- Standard mode: pack from column-major, compute, unpack ---
     bfloat16 *A_blk = cache.scratch_A((size_t)M * K);
     bfloat16 *B_blk = cache.scratch_B((size_t)K * N);
     bfloat16 *C_blk = cache.scratch_C((size_t)M * N);
 
-    // --- Pack A (skip if same pointer + size as last call) ---
     auto t0 = clk::now();
-    size_t a_sz = (size_t)M * K;
-    if (A != cache.last_A_ptr() || a_sz != cache.last_A_sz()) {
-        pack_A_to_blocked_vnni(A, A_blk, M, K, bm, bk);
-        cache.set_last_A(A, a_sz);
-    }
+    pack_A_to_blocked_vnni(A, A_blk, M, K, bm, bk);
     auto t1 = clk::now();
     tm.pack_a += std::chrono::duration<double>(t1 - t0).count();
 
-    // --- Pack B (skip if same pointer + size as last call) ---
     t0 = clk::now();
-    size_t b_sz = (size_t)K * N;
-    if (B != cache.last_B_ptr() || b_sz != cache.last_B_sz()) {
-        pack_B_to_blocked(B, B_blk, K, N, bk, bn);
-        cache.set_last_B(B, b_sz);
-    }
+    pack_B_to_blocked(B, B_blk, K, N, bk, bn);
     t1 = clk::now();
     tm.pack_b += std::chrono::duration<double>(t1 - t0).count();
 
-    // --- Compute ---
     t0 = clk::now();
     void *cfg = cache.get_config(M, N, K);
     run_sfc_gemm(cfg, A_blk, B_blk, C_blk);
     t1 = clk::now();
-    {
-        double dt = std::chrono::duration<double>(t1 - t0).count();
-        double gf = 2.0 * (double)M * N * K * 1e-9 / dt;
-        std::fprintf(stderr,
-            "[bf16 gemm] M=%d N=%d K=%d  compute=%.4f s  %.1f GFLOP/s  "
-            "(call #%d)\n",
-            M, N, K, dt, gf, tm.calls);
-        std::fflush(stderr);
-    }
     tm.compute += std::chrono::duration<double>(t1 - t0).count();
 
-    // --- Unpack / alpha-beta ---
     t0 = clk::now();
     if (float(alpha) != 1.0f || float(beta) != 0.0f) {
         const float fa = float(alpha), fb = float(beta);
@@ -224,7 +295,6 @@ void gemm(const int M,
             }
         }
     } else {
-        // Simple case: alpha==1, beta==0 → just unpack
         unpack_C_from_blocked(C_blk, C, M, N, bm, bn);
     }
     t1 = clk::now();

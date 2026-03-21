@@ -21,9 +21,11 @@
 #include <cosma/matrix.hpp>
 #include <cosma/mpi_mapper.hpp>
 #include <cosma/sfc_gemm_wrapper.hpp>
+#include <cosma/environment_variables.hpp>
 #include <cosma/blas.hpp>
 #include <mkl.h>
 #include <mpi.h>
+#include <libxsmm.h>
 
 #include <algorithm>
 #include <cmath>
@@ -140,19 +142,23 @@ static bool correctness_test(int rank) {
                 bf16(0.0f), C.data(), M);
     ref_gemm_f32(M, N, K, Af.data(), Bf.data(), Cf.data());
 
-    double max_abs = 0;
-    double sum_sq_err = 0.0, sum_sq_ref = 0.0;
-    for (int i = 0; i < M * N; ++i) {
-        float got = float(C[i]), ref = Cf[i];
-        double ae = std::fabs(got - ref);
-        if (ae > max_abs) max_abs = ae;
-        sum_sq_err += ae * ae;
-        sum_sq_ref += (double)ref * ref;
-    }
-    double check_norm = (sum_sq_ref > 0) ? std::sqrt(sum_sq_err / sum_sq_ref) : 0.0;
-    std::cout << "  Max abs err: " << max_abs
-              << "  Check-norm: " << check_norm << "\n";
-    bool ok = (check_norm < 0.01);
+    // Convert bf16 result to float for libxsmm_matdiff
+    std::vector<float> Ctest(M * N);
+    for (int i = 0; i < M * N; ++i)
+        Ctest[i] = float(C[i]);
+
+    libxsmm_matdiff_info norms;
+    libxsmm_matdiff_clear(&norms);
+    libxsmm_matdiff(&norms, LIBXSMM_DATATYPE_F32, (libxsmm_blasint)(M * N), 1,
+                    Cf.data(), Ctest.data(), 0, 0);
+    std::printf("  L1 reference  : %.25g\n", norms.l1_ref);
+    std::printf("  L1 test       : %.25g\n", norms.l1_tst);
+    std::printf("  L2 abs.error  : %.24f\n", norms.l2_abs);
+    std::printf("  L2 rel.error  : %.24f\n", norms.l2_rel);
+    std::printf("  Linf abs.error: %.24f\n", norms.linf_abs);
+    std::printf("  Linf rel.error: %.24f\n", norms.linf_rel);
+    std::printf("  Check-norm    : %.24f\n", norms.normf_rel);
+    bool ok = (norms.normf_rel < 0.01);
     std::cout << "  " << (ok ? "PASSED" : "FAILED") << "\n";
     return ok;
 }
@@ -182,6 +188,9 @@ int main(int argc, char **argv) {
     if (argc > 4) nreps = std::atoi(argv[4]);
 
     cosma::Strategy strategy(M, N, K, nprocs);
+    if (cosma::get_overlap_comm_and_comp()) {
+        strategy.enable_overlapping_comm_and_comp();
+    }
 
     if (rank == 0) {
         std::cout << "\n--- Performance test ---\n";
@@ -270,9 +279,141 @@ int main(int argc, char **argv) {
         all_B_buf.clear(); all_B_buf.shrink_to_fit();
     }
 
-    // 2) Run COSMA multiply (warmup)
+    // --- Mode selection and packing (before correctness check) ---
+    // The correctness check exercises the actual mode (prepacked or
+    // blocked_comm) to validate that the kernel produces correct results.
+    bool can_prepacked = true;
+    for (size_t s = 0; s < strategy.n_steps(); ++s) {
+        if (strategy.parallel_step(s) &&
+            (strategy.split_m(s) || strategy.split_n(s))) {
+            can_prepacked = false;
+            break;
+        }
+    }
+    if (rank == 0) {
+        std::fprintf(stderr, "[info] can_prepacked=%d (strategy has %zu steps)\n",
+                     (int)can_prepacked, strategy.n_steps());
+        std::fflush(stderr);
+    }
+
+    const char *mode_label = "STANDARD (per-call pack/unpack)";
+
+    // Local C dims for unpack after correctness multiply
+    int local_m_C = 0, local_n_C = 0;
+    if (rank < strategy.P) {
+        auto& c_blocks = C.initial_layout();
+        local_m_C = c_blocks[0].rows.end_ - c_blocks[0].rows.start_ + 1;
+        local_n_C = c_blocks[0].cols.end_ - c_blocks[0].cols.start_ + 1;
+    }
+
+    if (can_prepacked) {
+        mode_label = "PREPACKED";
+        auto desc = cosma::get_sfc_gemm_cache().block_desc();
+        int bm = desc.bm, bn = desc.bn, bk = desc.bk;
+
+        int local_m_A = M;
+        int local_k_A = (int)((size_t)A.matrix_size() / local_m_A);
+        int local_n_B = N;
+        int local_k_B = (int)((size_t)B.matrix_size() / local_n_B);
+        size_t a_sz = (size_t)A.matrix_size();
+        size_t b_sz = (size_t)B.matrix_size();
+
+        // Pack A in-place (col-major -> VNNI blocked)
+        {
+            bf16 *a_ptr = A.matrix_pointer();
+            int lbm = bm, lbk = bk;
+            while (local_m_A % lbm != 0 && lbm > 1) --lbm;
+            while (local_k_A % lbk != 0 && lbk > 1) --lbk;
+            std::vector<bf16> a_tmp(a_sz);
+            if (rank == 0)
+                std::fprintf(stderr, "[pack] A: sz=%zu m=%d k=%d bm=%d bk=%d\n",
+                    a_sz, local_m_A, local_k_A, lbm, lbk);
+            cosma::pack_A_to_blocked_vnni(a_ptr, a_tmp.data(), local_m_A, local_k_A, lbm, lbk);
+            std::memcpy(a_ptr, a_tmp.data(), a_sz * sizeof(bf16));
+        }
+        // Pack B in-place (col-major -> blocked)
+        {
+            bf16 *b_ptr = B.matrix_pointer();
+            int lbk = bk, lbn = bn;
+            while (local_k_B % lbk != 0 && lbk > 1) --lbk;
+            while (local_n_B % lbn != 0 && lbn > 1) --lbn;
+            std::vector<bf16> b_tmp(b_sz);
+            if (rank == 0)
+                std::fprintf(stderr, "[pack] B: sz=%zu k=%d n=%d bk=%d bn=%d\n",
+                    b_sz, local_k_B, local_n_B, lbk, lbn);
+            cosma::pack_B_to_blocked(b_ptr, b_tmp.data(), local_k_B, local_n_B, lbk, lbn);
+            std::memcpy(b_ptr, b_tmp.data(), b_sz * sizeof(bf16));
+        }
+        cosma::get_sfc_gemm_cache().set_prepacked(true);
+    } else {
+        mode_label = "BLOCKED_COMM (K-outer A + reshuffle)";
+        auto desc = cosma::get_sfc_gemm_cache().block_desc();
+        int bm = desc.bm, bn = desc.bn, bk = desc.bk;
+
+        auto& a_blocks = A.initial_layout();
+        int local_m_A = a_blocks[0].rows.end_ - a_blocks[0].rows.start_ + 1;
+        int local_k_A = a_blocks[0].cols.end_ - a_blocks[0].cols.start_ + 1;
+        size_t a_sz = (size_t)A.matrix_size();
+
+        auto& b_blocks = B.initial_layout();
+        int local_k_B = b_blocks[0].rows.end_ - b_blocks[0].rows.start_ + 1;
+        int local_n_B = b_blocks[0].cols.end_ - b_blocks[0].cols.start_ + 1;
+        size_t b_sz = (size_t)B.matrix_size();
+
+        // Pack A in-place to K-outer VNNI
+        // Layout: [Kb][Mb][bk/2][bm][2]
+        {
+            bf16 *a_ptr = A.matrix_pointer();
+            int lbm = bm, lbk_a = bk;
+            while (local_m_A % lbm != 0 && lbm > 1) --lbm;
+            while (local_k_A % lbk_a != 0 && lbk_a > 1) --lbk_a;
+            std::vector<bf16> a_tmp(a_sz);
+            if (rank == 0)
+                std::fprintf(stderr, "[blocked_comm] pack A K-outer: sz=%zu m=%d k=%d bm=%d bk=%d\n",
+                    a_sz, local_m_A, local_k_A, lbm, lbk_a);
+            cosma::pack_A_to_blocked_vnni_Kouter(a_ptr, a_tmp.data(),
+                                                  local_m_A, local_k_A, lbm, lbk_a);
+            std::memcpy(a_ptr, a_tmp.data(), a_sz * sizeof(bf16));
+        }
+        // Pack B in-place to standard blocked
+        {
+            bf16 *b_ptr = B.matrix_pointer();
+            int lbk = bk, lbn = bn;
+            while (local_k_B % lbk != 0 && lbk > 1) --lbk;
+            while (local_n_B % lbn != 0 && lbn > 1) --lbn;
+            std::vector<bf16> b_tmp(b_sz);
+            if (rank == 0)
+                std::fprintf(stderr, "[blocked_comm] pack B: sz=%zu k=%d n=%d bk=%d bn=%d\n",
+                    b_sz, local_k_B, local_n_B, lbk, lbn);
+            cosma::pack_B_to_blocked(b_ptr, b_tmp.data(), local_k_B, local_n_B, lbk, lbn);
+            std::memcpy(b_ptr, b_tmp.data(), b_sz * sizeof(bf16));
+        }
+
+        cosma::get_sfc_gemm_cache().set_blocked_comm(true);
+        int rmode = cosma::get_sfc_gemm_cache().reshuffle_mode();
+        if (rmode == 1)
+            mode_label = "BLOCKED_COMM (K-outer A, reshuffle=post-allgather)";
+        else
+            mode_label = "BLOCKED_COMM (K-outer A, reshuffle=leaf-gemm)";
+    }
+
+    // 2) Run COSMA multiply (correctness — exercises actual mode)
     cosma::get_sfc_gemm_cache().reset_pack_cache();
     cosma::multiply(A, B, C, strategy, MPI_COMM_WORLD, alpha, beta);
+
+    // Unpack C from blocked [Nb][Mb][bn][bm] to col-major for correctness
+    if (rank < strategy.P && local_m_C > 0 && local_n_C > 0) {
+        auto desc = cosma::get_sfc_gemm_cache().block_desc();
+        int bm = desc.bm, bn = desc.bn;
+        int lbm = bm, lbn = bn;
+        while (local_m_C % lbm != 0 && lbm > 1) --lbm;
+        while (local_n_C % lbn != 0 && lbn > 1) --lbn;
+        size_t c_sz = (size_t)C.matrix_size();
+        std::vector<bf16> c_tmp(c_sz);
+        cosma::unpack_C_from_blocked(C.matrix_pointer(), c_tmp.data(),
+                                     local_m_C, local_n_C, lbm, lbn);
+        std::memcpy(C.matrix_pointer(), c_tmp.data(), c_sz * sizeof(bf16));
+    }
 
     // 3) Gather distributed C to rank 0
     std::vector<bf16> all_C_buf;
@@ -311,8 +452,9 @@ int main(int argc, char **argv) {
 
         // Reference: C_ref = A * B in float32 using MKL
         std::vector<float> refCf((size_t)M * N, 0.0f);
-        std::cout << "\n--- Distributed correctness: " << M << "x" << N
-                  << "x" << K << " (float32 ref via MKL) ---\n" << std::flush;
+        std::cout << "\n--- Distributed correctness (" << mode_label << "): "
+                  << M << "x" << N << "x" << K
+                  << " (float32 ref via MKL) ---\n" << std::flush;
         {
             float one = 1.0f, zero = 0.0f;
             cblas_sgemm(CblasColMajor, CblasNoTrans, CblasNoTrans,
@@ -324,18 +466,19 @@ int main(int argc, char **argv) {
         globAf.clear(); globAf.shrink_to_fit();
         globBf.clear(); globBf.shrink_to_fit();
 
-        double sum_sq_err = 0.0, sum_sq_ref = 0.0;
-        double max_abs = 0.0;
-        for (size_t i = 0; i < (size_t)M * N; ++i) {
-            double ae = std::fabs(globCf[i] - refCf[i]);
-            if (ae > max_abs) max_abs = ae;
-            sum_sq_err += ae * ae;
-            sum_sq_ref += (double)refCf[i] * refCf[i];
-        }
-        double check_norm = (sum_sq_ref > 0) ? std::sqrt(sum_sq_err / sum_sq_ref) : 0.0;
-        std::printf("  Max abs err : %.6f\n", max_abs);
-        std::printf("  Check-norm  : %.8f\n", check_norm);
-        bool ok = (check_norm < 0.01);
+        libxsmm_matdiff_info norms;
+        libxsmm_matdiff_clear(&norms);
+        libxsmm_matdiff(&norms, LIBXSMM_DATATYPE_F32,
+                        (libxsmm_blasint)((size_t)M * N), 1,
+                        refCf.data(), globCf.data(), 0, 0);
+        std::printf("  L1 reference  : %.25g\n", norms.l1_ref);
+        std::printf("  L1 test       : %.25g\n", norms.l1_tst);
+        std::printf("  L2 abs.error  : %.24f\n", norms.l2_abs);
+        std::printf("  L2 rel.error  : %.24f\n", norms.l2_rel);
+        std::printf("  Linf abs.error: %.24f\n", norms.linf_abs);
+        std::printf("  Linf rel.error: %.24f\n", norms.linf_rel);
+        std::printf("  Check-norm    : %.24f\n", norms.normf_rel);
+        bool ok = (norms.normf_rel < 0.01);
         std::cout << "  " << (ok ? "PASSED" : "FAILED") << "\n" << std::flush;
     }
     PMPI_Barrier(MPI_COMM_WORLD);
@@ -354,6 +497,9 @@ int main(int argc, char **argv) {
     PMPI_Barrier(MPI_COMM_WORLD);
     double wall1 = PMPI_Wtime();
     double wall_per_call = (wall1 - wall0) / nreps;
+
+    cosma::get_sfc_gemm_cache().set_prepacked(false);
+    cosma::get_sfc_gemm_cache().set_blocked_comm(false);
 
     // Gather per-phase timers
     auto &tm = cosma::get_sfc_gemm_cache().timers();
@@ -381,6 +527,7 @@ int main(int argc, char **argv) {
 
     if (rank == 0) {
         std::cout << "\n=== COSMA bf16 multiply results ===\n";
+        std::cout << "Mode           : " << mode_label << "\n";
         std::cout << "Global GEMM    : " << M << " x " << N << " x " << K << "\n";
         std::cout << "Total GFLOP    : " << total_gflops << "\n";
         std::cout << "Wall time/call : " << wall_per_call << " s\n";

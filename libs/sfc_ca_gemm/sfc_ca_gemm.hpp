@@ -107,6 +107,7 @@ typedef struct
   long unblocked_bc;     // 0 = blocked activations (NCNC), 1 = flat activations (NC), 2 = flat with upfront packing of B
   void *scratch_B;       // scratch buffer for upfront packing of B (unblocked_bc == 2)
   libxsmm_meltwfunction_unary b_xform_kernel;  // identity kernel for packing B
+  long a_k_outer;        // 0 = A in [Mb][Kb][...] (M-outer, default), 1 = A in [Kb][Mb][...] (K-outer)
   // oneDNN-specific fields
   void *onednn_brgemm_kernel;  // dnnl::ukernel::brgemm*
   size_t onednn_scratchpad_size;
@@ -120,7 +121,8 @@ gemm_config_t *setup_gemm_config(
     long &kbf, long &K_layers,
     long m_step = 1, long n_step = 1,
     long unblocked_bc = 0,
-    long use_nts = 0)
+    long use_nts = 0,
+    long a_k_outer = 0)
 {
   gemm_config_t *config = new gemm_config_t();
   // Calculate derived parameters
@@ -158,6 +160,7 @@ gemm_config_t *setup_gemm_config(
   config->m_step = m_step;
   config->n_step = n_step;
   config->unblocked_bc = unblocked_bc;
+  config->a_k_outer = a_k_outer;
 
   // Allocate output_partial scratch buffers for K_layers > 1
   using CType = typename output_type<DType>::type;
@@ -194,7 +197,11 @@ gemm_config_t *setup_gemm_config(
   auto l_tr_flags = LIBXSMM_GEMM_FLAG_NO_SETUP_TILECONFIG | LIBXSMM_GEMM_VNNI_FLAGS('N', 'N', 'V', 'N');
   auto l_shape = libxsmm_create_gemm_shape(bm, bn, bk, bm, (unblocked_bc == 1) ? K : bk, (unblocked_bc > 0) ? M : bm, dtype, dtype, dtype_out, dtype_comp);
   auto l_prefetch_flags = LIBXSMM_GEMM_PREFETCH_NONE;
-  auto l_brconfig = libxsmm_create_gemm_batch_reduce_config(LIBXSMM_GEMM_BATCH_REDUCE_STRIDE, bm * bk * sizeof(DType), (unblocked_bc == 1) ? bk * sizeof(DType) : bk * bn * sizeof(DType), brcount);
+  // A stride for BRGEMM:
+  //   M-outer (0): [Mb][Kb][bk*bm] -> stride bm*bk
+  //   K-outer (1): [Kb][Mb][bk*bm] -> stride M*bk
+  long a_brgemm_stride = (a_k_outer == 1) ? (M * bk * (long)sizeof(DType)) : (bm * bk * (long)sizeof(DType));
+  auto l_brconfig = libxsmm_create_gemm_batch_reduce_config(LIBXSMM_GEMM_BATCH_REDUCE_STRIDE, a_brgemm_stride, (unblocked_bc == 1) ? bk * sizeof(DType) : bk * bn * sizeof(DType), brcount);
   auto l_unary_shape = libxsmm_create_meltw_unary_shape((unblocked_bc > 0) ? bm : bm * bn, (unblocked_bc > 0) ? bn : 1, (unblocked_bc > 0) ? M : bm * bn, (unblocked_bc > 0) ? M : bm * bn, dtype_out, dtype_out, dtype_comp);
   if (K_rounds_per_layer == 1) l_flags |= LIBXSMM_GEMM_FLAG_BETA_0;
   if (use_nts > 0) l_flags |= LIBXSMM_GEMM_FLAG_ALIGN_C_NTS_HINT;

@@ -28,6 +28,7 @@ void run_gemm(gemm_config_t *config, DType *A, DType *B, typename output_type<DT
   using CType = typename output_type<DType>::type;
   long M = config->M, N = config->N, K = config->K, Mb = config->Mb, Nb = config->Nb, Kb = config->Kb, bm = config->bm, bn = config->bn, bk = config->bk, K_layers = config->K_layers, brcount = config->brcount;
   long unblocked_bc = config->unblocked_bc;
+  long a_k_outer = config->a_k_outer;
   CType **scratch_C = (CType**)config->gemm_scratch;
   unsigned char *sfc_index_map = config->sfc_index_map;
   unsigned int index_tsize = config->index_tsize;
@@ -78,7 +79,14 @@ void run_gemm(gemm_config_t *config, DType *A, DType *B, typename output_type<DT
           }
         }
         gemm_param.op.tertiary = (void *)&brcount_use;
-        gemm_param.a.primary = (void *)((DType *)A + i_m * K * bm + i_k * bk * bm + i_k_layer * Kb_per_layer * bk * bm);
+        // A indexing:
+        //   M-outer (0): [Mb][Kb][bk*bm]
+        //   K-outer (1): [Kb][Mb][bk*bm]
+        if (a_k_outer == 1) {
+          gemm_param.a.primary = (void *)((DType *)A + i_k * M * bk + i_m * bm * bk + i_k_layer * Kb_per_layer * M * bk);
+        } else {
+          gemm_param.a.primary = (void *)((DType *)A + i_m * K * bm + i_k * bk * bm + i_k_layer * Kb_per_layer * bk * bm);
+        }
         if (unblocked_bc == 2) {
           gemm_param.b.primary = (void *)((DType *)config->scratch_B + i_n * K * bn + i_k * bk * bn + i_k_layer * Kb_per_layer * bk * bn);
         } else if (unblocked_bc == 1) {

@@ -12,6 +12,7 @@
 #include <sfc_ca_gemm.cpp>
 
 #include <cosma/sfc_gemm_wrapper.hpp>
+#include <cosma/environment_variables.hpp>
 
 #include <cassert>
 #include <cstdio>
@@ -30,15 +31,34 @@ sfc_gemm_cache::sfc_gemm_cache(blocked_layout_desc desc) : desc_(desc) {}
 
 sfc_gemm_cache::~sfc_gemm_cache() {
     for (auto &kv : cache_) {
-        delete static_cast<gemm_config_t *>(kv.second);
+        auto *cfg = static_cast<gemm_config_t *>(kv.second);
+        // Free libxsmm-allocated internals before deleting the struct.
+        if (cfg->gemm_scratch) {
+            auto **arr = static_cast<libxsmm_bfloat16 **>(cfg->gemm_scratch);
+            if (arr[0]) libxsmm_free(arr[0]); // global_scratch block
+            libxsmm_free(arr);                // pointer array
+            cfg->gemm_scratch = nullptr;
+        }
+        if (cfg->sfc_index_map) {
+            libxsmm_free(cfg->sfc_index_map);
+            cfg->sfc_index_map = nullptr;
+        }
+        if (cfg->scratch_B) {
+            libxsmm_free(cfg->scratch_B);
+            cfg->scratch_B = nullptr;
+        }
+        delete cfg;
     }
-    if (buf_A_) libxsmm_free(buf_A_);
-    if (buf_B_) libxsmm_free(buf_B_);
-    if (buf_C_) libxsmm_free(buf_C_);
+    if (buf_A_) { libxsmm_free(buf_A_); buf_A_ = nullptr; }
+    if (buf_B_) { libxsmm_free(buf_B_); buf_B_ = nullptr; }
+    if (buf_C_) { libxsmm_free(buf_C_); buf_C_ = nullptr; }
 }
 
 void *sfc_gemm_cache::get_config(int M, int N, int K) {
-    key_t key{M, N, K};
+    // Always use a_k_outer=0 (M-outer): in blocked_comm mode the caller
+    // reshuffles A from K-outer to M-outer before the kernel call.
+    int ako = 0;
+    key_t key{M, N, K, ako};
     auto it = cache_.find(key);
     if (it != cache_.end())
         return it->second;
@@ -58,13 +78,14 @@ void *sfc_gemm_cache::get_config(int M, int N, int K) {
     gemm_config_t *cfg = setup_gemm_config<libxsmm_bfloat16>(
         M, N, K, bm, bn, bk, kbf, K_layers,
         /*m_step=*/1, /*n_step=*/1,
-        /*unblocked_bc=*/0, /*use_nts=*/0);
+        /*unblocked_bc=*/0, /*use_nts=*/0,
+        /*a_k_outer=*/ako);
 
     std::fprintf(stderr,
         "[sfc_ca_gemm] new config: M=%d N=%d K=%d bm=%d bn=%d bk=%d "
-        "kbf=%ld K_layers=%ld brcount=%ld\n",
+        "kbf=%ld K_layers=%ld brcount=%ld a_k_outer=%d\n",
         M, N, K, bm, bn, bk, kbf, K_layers, 
-        static_cast<gemm_config_t *>(cfg)->brcount);
+        static_cast<gemm_config_t *>(cfg)->brcount, ako);
     std::fflush(stderr);
 
     cache_[key] = cfg;
@@ -148,6 +169,57 @@ void pack_A_to_blocked_vnni(const bfloat16 *src, bfloat16 *dst,
                     dst[dst_idx].raw = src[gj * M + gi].raw;
                 }
             }
+        }
+    }
+}
+
+void pack_A_to_blocked_vnni_Kouter(const bfloat16 *src, bfloat16 *dst,
+                                   int M, int K, int bm, int bk) {
+    // Source: column-major M×K  (element (i,j) at src[j*M + i])
+    // Dest:   [Kb][Mb][bk/2][bm][2]   (K-outer VNNI, compatible with COSMA comm)
+    //
+    // K outermost makes allgather-expand-K = flat concat, K-split = pointer offset.
+    const int Mb = M / bm;
+    const int Kb = K / bk;
+    const int vnni = 2;
+    const int blk_elems = (bk / vnni) * bm * vnni;  // = bk * bm
+
+    #pragma omp parallel for collapse(2)
+    for (int kb = 0; kb < Kb; ++kb) {
+        for (int mb = 0; mb < Mb; ++mb) {
+            for (int k2 = 0; k2 < bk; ++k2) {
+                for (int m2 = 0; m2 < bm; ++m2) {
+                    int gi = mb * bm + m2;
+                    int gj = kb * bk + k2;
+                    // dst index: [kb][mb][k2/vnni][m2][k2%vnni]
+                    int dst_idx = kb * (Mb * blk_elems)
+                                + mb * blk_elems
+                                + (k2 / vnni) * (bm * vnni)
+                                + m2 * vnni
+                                + (k2 % vnni);
+                    dst[dst_idx].raw = src[gj * M + gi].raw;
+                }
+            }
+        }
+    }
+}
+
+void reshuffle_A_Kouter_to_Mouter(const bfloat16 *src, bfloat16 *dst,
+                                  int M, int K, int bm, int bk) {
+    // Source: K-outer [Kb][Mb][bk*bm]   (tile at (kb,mb) = offset kb*Mb + mb)
+    // Dest:   M-outer [Mb][Kb][bk*bm]   (tile at (mb,kb) = offset mb*Kb + kb)
+    // Each tile is bm*bk contiguous elements, copied intact.
+    const int Mb = M / bm;
+    const int Kb = K / bk;
+    const int tile_elems = bm * bk;
+    const size_t tile_bytes = (size_t)tile_elems * sizeof(bfloat16);
+
+    #pragma omp parallel for collapse(2)
+    for (int kb = 0; kb < Kb; ++kb) {
+        for (int mb = 0; mb < Mb; ++mb) {
+            const bfloat16 *s = src + ((size_t)kb * Mb + mb) * tile_elems;
+            bfloat16       *d = dst + ((size_t)mb * Kb + kb) * tile_elems;
+            std::memcpy(d, s, tile_bytes);
         }
     }
 }
@@ -244,10 +316,18 @@ void run_sfc_gemm(void *config_opaque,
 }
 
 // Singleton accessor for the global sfc_gemm_cache used by gemm().
+// Intentionally leaked (heap-allocated, never destructed) to avoid
+// atexit ordering issues: libxsmm_finalize() frees all libxsmm-tracked
+// allocations, so a static-local destructor running afterward would
+// double-free those pointers.  The OS reclaims everything at exit.
 static sfc_gemm_cache &singleton_cache() {
-    static blocked_layout_desc desc{32, 32, 32, 4, 1};
-    static sfc_gemm_cache cache(desc);
-    return cache;
+    static blocked_layout_desc desc{32, 32, 32, 2, 3};
+    static auto *cache = []() {
+        auto *c = new sfc_gemm_cache(desc);
+        c->set_reshuffle_mode(get_bf16_reshuffle_mode());
+        return c;
+    }();
+    return *cache;
 }
 
 sfc_gemm_cache &get_sfc_gemm_cache() {
