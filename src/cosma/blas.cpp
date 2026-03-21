@@ -212,8 +212,8 @@ void gemm(const int M,
 
         // Determine the A pointer for the kernel (always M-outer, a_k_outer=0)
         bfloat16 *A_for_kernel;
-        if (cache.reshuffle_mode() == 1) {
-            // Mode 1: A already reshuffled to M-outer by multiply/overlap layer
+        if (cache.is_a_reshuffled()) {
+            // A already reshuffled to M-outer by multiply/overlap layer
             A_for_kernel = const_cast<bfloat16 *>(A);
         } else {
             // Mode 0: reshuffle A from K-outer to M-outer here

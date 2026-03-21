@@ -636,6 +636,7 @@ void overlap_n_split(bool use_busy_waiting,
                         scratch, M_local, K_chunk, bm, bk);
                     std::memcpy(pointer_a, scratch,
                                 (size_t)M_local * K_chunk * sizeof(Scalar));
+                    cache.set_a_reshuffled(true);
                 }
             }
 #endif

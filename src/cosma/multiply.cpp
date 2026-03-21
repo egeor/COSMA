@@ -264,6 +264,13 @@ void multiply(cosma_context<Scalar> *ctx,
 	return;
     }
 
+#ifdef COSMA_WITH_SFC_GEMM
+    // Reset per-multiply reshuffle tracking for blocked-comm mode
+    if constexpr (std::is_same_v<Scalar, cosma::bfloat16>) {
+        get_sfc_gemm_cache().set_a_reshuffled(false);
+    }
+#endif
+
     Interval mi = Interval(0, strategy.m - 1);
     Interval ni = Interval(0, strategy.n - 1);
     Interval ki = Interval(0, strategy.k - 1);
@@ -811,6 +818,7 @@ void parallel(cosma_context<Scalar> *ctx,
                     scratch, M_local, K_local, bm, bk);
                 std::memcpy(expanded_matrix, scratch,
                             (size_t)M_local * K_local * sizeof(cosma::bfloat16));
+                cache.set_a_reshuffled(true);
             }
         }
 #endif
