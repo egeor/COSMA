@@ -198,15 +198,42 @@ See `run_bf16_scaling.sbatch` for the parameterized script.
 
 ---
 
-## Performance Results (32768 × 16384 × 32768, 16 nodes / 32 ranks)
+## Scaling Results
 
-| Reshuffle | Overlap | Total GFLOP/s | pack_A (ms) | compute (ms) | Local GFLOP/s/rank |
-|-----------|---------|--------------|-------------|-------------|-------------------|
-| Mode 0 (leaf) | OFF | 149,587 | 2.4 | 21.3 | 46,394 |
-| Mode 1 (post-ag) | OFF | 139,608 | 0.0 | 21.5 | 51,140 |
-| Mode 0 (leaf) | ON  | 147,851 | 2.3 | 21.2 | 46,766 |
-| Mode 1 (post-ag) | ON  | 140,873 | 0.0 | 21.5 | 51,140 |
+### 4 nodes / 8 ranks — 16384 × 8192 × 16384
 
-- Pure kernel rate: ~51,500 GFLOP/s per rank (~1.66 PFLOP/s aggregate)
-- Mode 1 removes 2.3 ms reshuffle from compute path → +9.5% local throughput
-- Total GFLOP/s dominated by MPI time (~215 ms); run-to-run variance ~5-7%
+| Reshuffle | Total GFLOP/s | pack_A (ms) | compute (ms) | MPI (ms) | Wall (ms) | Compute GFLOP/s/rank |
+|-----------|--------------|-------------|-------------|---------|----------|---------------------|
+| Mode 0 (leaf) | 34,339 | 0.8 | 14.0 | 114.0 | 128.1 | 39,367 |
+| Mode 1 (post-ag) | 34,144 | 0.9 | 13.8 | 114.9 | 128.8 | 39,833 |
+
+Strategy: `pm2, pk4` — no split_n step, so mode 1 falls back to leaf reshuffle
+(the `a_reshuffled_` flag ensures correctness).
+
+### 8 nodes / 16 ranks — 32768 × 8192 × 16384
+
+| Reshuffle | Total GFLOP/s | pack_A (ms) | compute (ms) | MPI (ms) | Wall (ms) | Compute GFLOP/s/rank |
+|-----------|--------------|-------------|-------------|---------|----------|---------------------|
+| Mode 0 (leaf) | 62,776 | 0.9 | 14.1 | 126.9 | 140.1 | 39,024 |
+| Mode 1 (post-ag) | 65,084 | 0.9 | 12.8 | 122.2 | 135.1 | 42,968 |
+
+Strategy: `pm2, pn2, pk4` — has split_n, so mode 1 reshuffles after allgather.
+Mode 1 shows +3.7% total GFLOP/s and +10.1% compute GFLOP/s per rank.
+
+### 16 nodes / 32 ranks — 32768 × 16384 × 32768
+
+| Reshuffle | Total GFLOP/s | pack_A (ms) | compute (ms) | MPI (ms) | Wall (ms) | Compute GFLOP/s/rank |
+|-----------|--------------|-------------|-------------|---------|----------|---------------------|
+| Mode 0 (leaf) | 152,058 | 2.4 | 20.9 | 210.1 | 231.4 | 52,537 |
+| Mode 1 (post-ag) | 140,933 | 0.0 | 21.5 | 213.5 | 249.7 | 51,128 |
+
+Strategy: `pm2, pn2, pk8` — has split_n. Mode 1 eliminates pack_A entirely.
+Total dominated by MPI time (~210 ms); run-to-run variance ~5-7%.
+
+### Key observations
+
+- All configurations pass correctness checks
+- Compute-only kernel rate: ~39k–52k GFLOP/s per rank depending on problem size
+- Mode 1 benefit is most visible at 8 nodes (+10% local compute throughput)
+- At 4 nodes mode 1 gracefully falls back to leaf reshuffle (no split_n in strategy)
+- MPI communication dominates wall time at all scales (80–90%)
