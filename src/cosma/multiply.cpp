@@ -10,6 +10,7 @@
 #include <costa/grid2grid/transformer.hpp>
 
 #include <complex>
+#include <type_traits>
 
 
 #if defined(COSMA_HAVE_GPU) && defined(COSMA_WITH_NCCL)
@@ -283,6 +284,17 @@ void multiply(cosma_context<Scalar> *ctx,
     matrixA.initialize();
     matrixB.initialize();
     matrixC.initialize();
+
+#ifdef COSMA_WITH_SFC_GEMM
+    // Preallocate the reshuffle scratch buffer for blocked-comm mode
+    // so that the first leaf GEMM doesn't pay alloc + first-touch cost.
+    if constexpr (std::is_same_v<Scalar, cosma::bfloat16>) {
+        auto &cache = get_sfc_gemm_cache();
+        if (cache.is_blocked_comm()) {
+            cache.scratch_A(matrixA.buffer_size());
+        }
+    }
+#endif
 
     // check if all the local matrices belong to
     // the current rank

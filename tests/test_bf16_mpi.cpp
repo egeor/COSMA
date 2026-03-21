@@ -390,6 +390,9 @@ int main(int argc, char **argv) {
         }
 
         cosma::get_sfc_gemm_cache().set_blocked_comm(true);
+        // Preallocate reshuffle scratch buffer (first-touch + alloc off critical path).
+        // Use initial local A size; scratch_A will grow if allgather expands A.
+        cosma::get_sfc_gemm_cache().scratch_A(a_sz);
         mode_label = "BLOCKED_COMM (K-outer A, leaf reshuffle)";
     }
 
