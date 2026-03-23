@@ -131,70 +131,369 @@ static blocked_layout_desc desc{32, 32, 32, 2, 3};
 
 ---
 
-## Running Experiments
+## Step-by-Step Setup, Build, and Run Guide
 
-### Prerequisites
+This section walks through every step from a clean checkout to running
+BF16 GEMM experiments with both backends (libxsmm and oneDNN).
+
+---
+
+### Step 0 — Prerequisites
+
+| Requirement | Version tested | Notes |
+|-------------|---------------|-------|
+| Intel oneAPI (compiler + MPI + MKL) | 2025.3 | Provides `mpiicpx`, MKL, Intel MPI |
+| oneDNN (optional, for oneDNN backend) | 3.12.0 | Pre-built at `~/onednn_2026/oneDNN/install/` |
+| CMake | ≥ 3.24 | |
+| Slurm | any | Cluster job scheduler |
+| SPR/EMR nodes with AMX | Sapphire Rapids / Emerald Rapids | Required for BF16 AMX instructions |
+
+---
+
+### Step 1 — Clone the repository
 
 ```bash
-# Intel toolchain
-source /swtools/intel/mpi/latest/env/vars.sh
+git clone -b feature/bf16-blocked-comm https://github.com/egeor/COSMA.git
+cd COSMA
+```
+
+---
+
+### Step 2 — Load the Intel toolchain
+
+On the **login node** (adjust path if different on your cluster):
+
+```bash
+source /data/swtools/intel/2025.3/oneapi-vars.sh --force
+```
+
+> **Note:** On compute nodes the path is typically `/swtools/intel/2025.3/oneapi-vars.sh`
+> (without `/data`). The sbatch scripts source the compute-node path automatically.
+
+Verify the compiler and MPI are available:
+
+```bash
+which mpiicpx    # should print a path
+echo $MKLROOT    # should be set (e.g. .../mkl/2025.3)
+```
+
+---
+
+### Step 3 — Build oneDNN (if not already installed)
+
+Skip this step if you already have a oneDNN installation.
+
+```bash
+cd ~
+git clone https://github.com/oneapi-src/oneDNN.git
+cd oneDNN
+mkdir build && cd build
+cmake .. -DCMAKE_CXX_COMPILER=icpx \
+         -DCMAKE_C_COMPILER=icx \
+         -DCMAKE_INSTALL_PREFIX=$HOME/onednn_install \
+         -DCMAKE_BUILD_TYPE=Release \
+         -DDNNL_CPU_RUNTIME=OMP
+make -j$(nproc) && make install
+cd ~
+```
+
+The install prefix (here `$HOME/onednn_install`) is passed to COSMA's
+cmake as `ONEDNN_PATH`. It must contain `include/` and `lib64/`.
+
+---
+
+### Step 4 — Configure COSMA with CMake
+
+```bash
+cd COSMA          # back to COSMA repo root
+mkdir -p build && cd build
+```
+
+**Both backends (libxsmm + oneDNN):**
+
+```bash
+cmake .. \
+  -DCMAKE_CXX_COMPILER=mpiicpx \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCOSMA_BLAS=MKL \
+  -DCOSMA_SCALAPACK=OFF \
+  -DCOSMA_WITH_SFC_GEMM=ON \
+  -DCOSMA_WITH_ONEDNN=ON \
+  -DONEDNN_PATH=$HOME/onednn_install
+```
+
+**libxsmm only (no oneDNN):**
+
+```bash
+cmake .. \
+  -DCMAKE_CXX_COMPILER=mpiicpx \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCOSMA_BLAS=MKL \
+  -DCOSMA_SCALAPACK=OFF \
+  -DCOSMA_WITH_SFC_GEMM=ON
+```
+
+**oneDNN only (no libxsmm):**
+
+```bash
+cmake .. \
+  -DCMAKE_CXX_COMPILER=mpiicpx \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCOSMA_BLAS=MKL \
+  -DCOSMA_SCALAPACK=OFF \
+  -DCOSMA_WITH_ONEDNN=ON \
+  -DONEDNN_PATH=$HOME/onednn_install
+```
+
+#### CMake options reference
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `COSMA_WITH_SFC_GEMM` | BOOL | OFF | Enable BF16 GEMM via sfc_ca_gemm (libxsmm AMX BRGEMM) |
+| `COSMA_WITH_ONEDNN` | BOOL | OFF | Enable BF16 GEMM via oneDNN matmul |
+| `ONEDNN_PATH` | STRING | `""` | Path to oneDNN install prefix (must contain `include/` and `lib64/`) |
+| `COSMA_BLAS` | STRING | — | BLAS library: `MKL`, `OPENBLAS`, etc. (required) |
+| `COSMA_SCALAPACK` | STRING | OFF | ScaLAPACK (not needed for BF16 tests) |
+
+---
+
+### Step 5 — Build the test binary
+
+```bash
+make -j$(nproc) test_bf16_mpi
+```
+
+The binary is at `build/tests/test_bf16_mpi`.
+
+**Usage:**
+
+```
+mpirun -n P ./numactl_wrapper.sh ./build/tests/test_bf16_mpi M N K [nreps]
+```
+
+where `P` = total MPI ranks, `M N K` = problem dimensions, `nreps` = timed
+iterations (default 5).
+
+---
+
+### Step 6 — Set runtime environment variables
+
+These environment variables control which backend is used and how the
+computation is configured:
+
+| Variable | Values | Default | Description |
+|----------|--------|---------|-------------|
+| `COSMA_GEMM_BACKEND` | `libxsmm`, `onednn` (or `dnnl`) | `libxsmm` | Selects the BF16 GEMM kernel (requires both backends compiled in) |
+| `COSMA_BF16_RESHUFFLE_MODE` | `0`, `1` | `0` | When to reshuffle A from K-outer to M-outer: `0`=at leaf GEMM, `1`=after allgather |
+| `COSMA_OVERLAP_COMM_AND_COMP` | `ON`, `OFF` | `OFF` | Enable COSMA communication-computation overlap |
+| `COSMA_CPU_MEMORY_ALIGNMENT` | bytes | `0` | Buffer alignment (`64` recommended for AMX) |
+| `OMP_NUM_THREADS` | integer | — | OpenMP threads per rank |
+| `KMP_AFFINITY` | string | — | Intel thread affinity (e.g. `granularity=fine,compact`) |
+| `FI_PROVIDER` | string | — | Libfabric provider (e.g. `psm3` for Intel MPI on OPA/OPX) |
+
+**Example (shell):**
+
+```bash
+export COSMA_GEMM_BACKEND=onednn      # use oneDNN backend
+export COSMA_CPU_MEMORY_ALIGNMENT=64
+export OMP_NUM_THREADS=64
+export KMP_AFFINITY=granularity=fine,compact
+export FI_PROVIDER=psm3
+```
+
+> **Note:** If built with only one backend (`COSMA_WITH_SFC_GEMM=ON` alone,
+> or `COSMA_WITH_ONEDNN=ON` alone), the `COSMA_GEMM_BACKEND` variable is
+> ignored and the available backend is always used.
+
+---
+
+### Step 7 — Run interactively (single node, quick test)
+
+```bash
+# On a compute node (e.g. via salloc)
+salloc --nodes=1 --ntasks-per-node=2 --cpus-per-task=64 \
+       --partition=emr --constraint="c1state" --exclusive --time=00:10:00
+
+source /swtools/intel/2025.3/oneapi-vars.sh --force
+export OMP_NUM_THREADS=64
+export KMP_AFFINITY=granularity=fine,compact
+export FI_PROVIDER=psm3
+export COSMA_CPU_MEMORY_ALIGNMENT=64
+export LD_LIBRARY_PATH=$HOME/onednn_install/lib64:$LD_LIBRARY_PATH
+
+cd /path/to/COSMA
+
+# libxsmm backend, small problem
+export COSMA_GEMM_BACKEND=libxsmm
+mpirun -n 2 ./numactl_wrapper.sh ./build/tests/test_bf16_mpi 4096 4096 4096 3
+
+# oneDNN backend, same problem
+export COSMA_GEMM_BACKEND=onednn
+mpirun -n 2 ./numactl_wrapper.sh ./build/tests/test_bf16_mpi 4096 4096 4096 3
+```
+
+---
+
+### Step 8 — Run via Slurm (multi-node)
+
+A ready-to-use sbatch script is included in the repo. Copy and edit it,
+or use it directly with environment variable overrides.
+
+#### 8a — Create the sbatch script
+
+A template `run_bf16_test.sbatch` is provided. Here is a minimal
+example you can adapt:
+
+```bash
+#!/bin/bash
+#SBATCH --job-name=bf16-test
+#SBATCH --partition=emr
+#SBATCH --ntasks-per-node=2
+#SBATCH --cpus-per-task=64
+#SBATCH --time=00:20:00
+#SBATCH --output=build/bf16_%j.out
+#SBATCH --error=build/bf16_%j.err
+#SBATCH --exclusive
+#SBATCH --constraint="c1state"
+
 source /swtools/intel/2025.3/oneapi-vars.sh --force
 
-# Build
-cd build
-make -j$(nproc) cosma
+export OMP_NUM_THREADS=64
+export KMP_AFFINITY=granularity=fine,compact
+export FI_PROVIDER=psm3
+export COSMA_CPU_MEMORY_ALIGNMENT=64
+export LD_LIBRARY_PATH=$HOME/onednn_install/lib64:$LD_LIBRARY_PATH
 
-# Compile test
-icpx -std=c++17 -O2 -fopenmp -mavx512f -mavx512bw -mavx512bf16 \
-  -DCOSMA_WITH_SFC_GEMM -DCOSMA_WITH_MKL_BLAS \
-  -I../src -I../libs/sfc_ca_gemm -I_deps/libxsmm-src/include \
-  -I_deps/costa-src/src -I_deps/costa-src/src/grid2grid \
-  -I$MKLROOT/include -I$I_MPI_ROOT/include \
-  ../tests/test_bf16_mpi.cpp \
-  -Lsrc/cosma -lcosma -L_deps/costa-build/src/costa -lcosta \
-  -L_deps/libxsmm-build -lxsmm -ldl \
-  -L$MKLROOT/lib -lmkl_intel_lp64 -lmkl_intel_thread -lmkl_core \
-  -liomp5 -lpthread -lm \
-  -L$I_MPI_ROOT/lib/release -L$I_MPI_ROOT/lib -lmpi -lmpicxx \
-  -o test_bf16_mpi
+# Backend selection (override via --export=ALL,COSMA_GEMM_BACKEND=onednn)
+export COSMA_GEMM_BACKEND=${COSMA_GEMM_BACKEND:-libxsmm}
+export COSMA_BF16_RESHUFFLE_MODE=${COSMA_BF16_RESHUFFLE_MODE:-0}
+
+# Problem size (override via --export=ALL,COSMA_M=32768,...)
+M=${COSMA_M:-8192}
+N=${COSMA_N:-8192}
+K=${COSMA_K:-8192}
+NREPS=${COSMA_NREPS:-5}
+
+NODES=${SLURM_NNODES}
+cd /path/to/COSMA
+
+echo "Nodes: ${NODES}, Ranks: $((NODES*2)), Problem: ${M}x${N}x${K}, Backend: ${COSMA_GEMM_BACKEND}"
+
+mpirun -n $((NODES * 2)) ./numactl_wrapper.sh ./build/tests/test_bf16_mpi ${M} ${N} ${K} ${NREPS}
 ```
 
-### Test usage
-
-```
-mpirun -n P ./numactl_wrapper.sh ./build/test_bf16_mpi M N K [nreps]
-```
-
-The test automatically selects PREPACKED or BLOCKED_COMM based on the
-strategy. It runs a single-rank correctness check, then a distributed
-correctness check (float32 MKL reference), then a timed loop.
-
-### Example: 16-node scaling with different modes
+#### 8b — Submit jobs
 
 ```bash
-# Mode 0 (leaf reshuffle), no overlap
-sbatch run_bf16_16n_prepacked.sbatch
+# 2-node run with libxsmm, 8k^3
+sbatch --nodes=2 run_bf16_test.sbatch
 
-# Mode 1 (post-allgather reshuffle), no overlap
-COSMA_BF16_RESHUFFLE_MODE=1 sbatch --export=ALL run_bf16_16n_prepacked.sbatch
+# 2-node run with oneDNN, 8k^3
+sbatch --nodes=2 --export=ALL,COSMA_GEMM_BACKEND=onednn run_bf16_test.sbatch
 
-# Mode 0 with communication-computation overlap
-COSMA_OVERLAP_COMM_AND_COMP=ON sbatch --export=ALL run_bf16_16n_prepacked.sbatch
+# 4-node run with libxsmm, 32k^3
+sbatch --nodes=4 --export=ALL,COSMA_GEMM_BACKEND=libxsmm,COSMA_M=32768,COSMA_N=32768,COSMA_K=32768 run_bf16_test.sbatch
 
-# Mode 1 with overlap (best for hiding reshuffle cost)
-COSMA_BF16_RESHUFFLE_MODE=1 COSMA_OVERLAP_COMM_AND_COMP=ON \
-  sbatch --export=ALL run_bf16_16n_prepacked.sbatch
-```
-
-### Scaling sweep (4, 8, 16 nodes)
-
-```bash
-for NODES in 4 8 16; do
-  sbatch run_bf16_scaling.sbatch $NODES
+# 8-node scaling sweep, both backends
+for NODES in 2 4 8; do
+  sbatch --nodes=$NODES --export=ALL,COSMA_GEMM_BACKEND=libxsmm run_bf16_test.sbatch
+  sbatch --nodes=$NODES --export=ALL,COSMA_GEMM_BACKEND=onednn  run_bf16_test.sbatch
 done
 ```
 
-See `run_bf16_scaling.sbatch` for the parameterized script.
+> **Important:** Use `--export=ALL,VAR=val` (not shell `export VAR=val`
+> before `sbatch`) to pass environment variables into the job. The `ALL`
+> ensures the rest of the environment is inherited.
+
+---
+
+### Step 9 — Check results
+
+```bash
+# Check if jobs passed correctness
+grep -E 'PASSED|FAILED' build/bf16_*.out
+
+# View performance summary
+grep -E 'Nodes|Problem|Backend|Mode|Wall time|Total GFLOP|compute-only|Check-norm' build/bf16_*.out
+
+# Check for errors
+cat build/bf16_*.err
+```
+
+**Expected output** (example, 2 nodes, 8k^3):
+
+```
+Nodes     : 2
+Problem   : 8192 x 8192 x 8192
+Backend   : libxsmm
+  Check-norm    : 0.003106894732730351455646
+  PASSED
+  Check-norm    : 0.003576104779453027383840
+  PASSED
+Mode           : BLOCKED_COMM (K-outer A, leaf reshuffle)
+Wall time/call : 0.0423407 s
+Total GFLOP/s  : 25968.2
+  compute-only   : 186856.8 GFLOP/s (agg), 46714.2 (per rank)
+```
+
+A check-norm ≤ 0.01 and `PASSED` means correctness is verified against
+a float32 MKL reference GEMM.
+
+---
+
+### Step 10 — NUMA binding (numactl_wrapper.sh)
+
+The provided `numactl_wrapper.sh` binds 2 MPI ranks per node to
+separate sockets for optimal memory locality on dual-socket systems:
+
+| Local rank | CPU cores | NUMA node |
+|-----------|-----------|-----------|
+| 0 | 0–63 | 0 |
+| 1 | 64–127 | 1 |
+
+This script is required for good performance — without it, ranks may
+contend for the same memory controller.
+
+Usage: always launch through the wrapper:
+
+```bash
+mpirun -n P ./numactl_wrapper.sh ./build/tests/test_bf16_mpi M N K [nreps]
+```
+
+---
+
+### Quick Reference — Complete Workflow
+
+```bash
+# 1. Clone
+git clone -b feature/bf16-blocked-comm https://github.com/egeor/COSMA.git
+cd COSMA
+
+# 2. Load toolchain (login node)
+source /data/swtools/intel/2025.3/oneapi-vars.sh --force
+
+# 3. Configure (both backends)
+mkdir -p build && cd build
+cmake .. \
+  -DCMAKE_CXX_COMPILER=mpiicpx \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCOSMA_BLAS=MKL \
+  -DCOSMA_SCALAPACK=OFF \
+  -DCOSMA_WITH_SFC_GEMM=ON \
+  -DCOSMA_WITH_ONEDNN=ON \
+  -DONEDNN_PATH=$HOME/onednn_install
+
+# 4. Build
+make -j$(nproc) test_bf16_mpi
+
+# 5. Submit (from repo root)
+cd ..
+sbatch --nodes=2 --export=ALL,COSMA_GEMM_BACKEND=libxsmm run_bf16_test.sbatch
+sbatch --nodes=2 --export=ALL,COSMA_GEMM_BACKEND=onednn  run_bf16_test.sbatch
+
+# 6. Check results
+grep -E 'PASSED|FAILED|Total GFLOP' build/bf16_*.out
+```
 
 ---
 
@@ -237,114 +536,3 @@ Total dominated by MPI time (~210 ms); run-to-run variance ~5-7%.
 - Mode 1 benefit is most visible at 8 nodes (+10% local compute throughput)
 - At 4 nodes mode 1 gracefully falls back to leaf reshuffle (no split_n in strategy)
 - MPI communication dominates wall time at all scales (80–90%)
-
----
-
-## oneDNN Backend Integration
-
-An alternative BF16 GEMM backend using Intel oneDNN can be enabled alongside
-the default sfc_ca_gemm (libxsmm) backend. Both backends use the **same
-`pack_A_to_blocked_vnni` packing routine** for the weight matrix A, producing
-identical VNNI-blocked layouts (`[Mb][Kb][bk/2][bm][2]`, bm=bk=32). The
-activations B and output C remain in flat column-major layout for oneDNN, while
-sfc_ca_gemm blocks all three matrices.
-
-The backend is selected at runtime via the `COSMA_GEMM_BACKEND` environment
-variable.
-
-### Files added/modified
-
-| File | Change |
-|------|--------|
-| `CMakeLists.txt` | Added `COSMA_WITH_ONEDNN` option and `ONEDNN_PATH` variable |
-| `src/cosma/CMakeLists.txt` | Added `onednn_gemm_wrapper.cpp`, oneDNN linkage, `COSMA_WITH_ONEDNN` compile definition |
-| `src/cosma/onednn_gemm_wrapper.hpp` | **New** — `onednn_gemm_cache` class header |
-| `src/cosma/onednn_gemm_wrapper.cpp` | **New** — oneDNN matmul primitive, uses `pack_A_to_blocked_vnni` for A packing |
-| `src/cosma/blas.cpp` | Dispatch to oneDNN in `gemm<bfloat16>()` when `COSMA_GEMM_BACKEND=onednn` |
-| `tests/test_bf16_mpi.cpp` | Conditional compilation with `#ifdef COSMA_WITH_SFC_GEMM` / `COSMA_WITH_ONEDNN` |
-| `run_bf16_onednn_test.sbatch` | **New** — Slurm batch script for both backends |
-
-### Prerequisites
-
-- Intel oneAPI 2025.3+ (compiler, MKL, MPI)
-- oneDNN installed (e.g. `~/onednn_2026/oneDNN/install/` with `lib64/libdnnl.so` and `include/oneapi/dnnl/`)
-- libxsmm (fetched automatically by CMake when `COSMA_WITH_SFC_GEMM=ON`)
-
-### Build
-
-```bash
-# Source Intel environment
-source /swtools/intel/2025.3/oneapi-vars.sh
-
-# Configure with both backends enabled
-cmake .. \
-  -DCMAKE_CXX_COMPILER=mpiicpx \
-  -DCOSMA_BLAS=MKL \
-  -DCOSMA_SCALAPACK=OFF \
-  -DCOSMA_WITH_SFC_GEMM=ON \
-  -DCOSMA_WITH_ONEDNN=ON \
-  -DONEDNN_PATH=$HOME/onednn_2026/oneDNN/install \
-  -DCMAKE_BUILD_TYPE=Release
-
-# Build the test
-make -j$(nproc) test_bf16_mpi
-```
-
-To build with oneDNN only (no libxsmm), omit `-DCOSMA_WITH_SFC_GEMM=ON`.
-In that case, A packing falls back to `dnnl::reorder`.
-
-### Run
-
-```bash
-# Set oneDNN library path
-export LD_LIBRARY_PATH=$HOME/onednn_2026/oneDNN/install/lib64:$LD_LIBRARY_PATH
-
-# Run with oneDNN backend
-export COSMA_GEMM_BACKEND=onednn
-mpirun -n 4 ./numactl_wrapper.sh ./build/tests/test_bf16_mpi 8192 8192 8192 5
-
-# Run with libxsmm backend (default)
-export COSMA_GEMM_BACKEND=libxsmm   # or unset COSMA_GEMM_BACKEND
-mpirun -n 4 ./numactl_wrapper.sh ./build/tests/test_bf16_mpi 8192 8192 8192 5
-```
-
-Or use the Slurm batch script:
-
-```bash
-# 2-node oneDNN test, 8k^3
-sbatch --nodes=2 --export=ALL,COSMA_GEMM_BACKEND=onednn,COSMA_M=8192,COSMA_N=8192,COSMA_K=8192 \
-  run_bf16_onednn_test.sbatch
-
-# 4-node libxsmm test, 32k^3 (default problem size)
-sbatch --nodes=4 --export=ALL,COSMA_GEMM_BACKEND=libxsmm \
-  run_bf16_onednn_test.sbatch
-```
-
-### Environment variables
-
-| Variable | Values | Default | Description |
-|----------|--------|---------|-------------|
-| `COSMA_GEMM_BACKEND` | `onednn`, `dnnl`, `libxsmm`, or unset | libxsmm | Select the BF16 GEMM kernel |
-| `COSMA_M`, `COSMA_N`, `COSMA_K` | integer | 32768 | Problem dimensions (sbatch script) |
-| `COSMA_NREPS` | integer | 5 | Number of timed repetitions (sbatch script) |
-
-### Performance comparison (32768³, pcl-spr nodes)
-
-| Nodes | Ranks | Backend | Wall time/call | Total GFLOP/s | Per-rank compute GFLOP/s |
-|-------|-------|---------|---------------|---------------|--------------------------|
-| 2 | 4 | oneDNN | 1.284 s | 54,790 | 23,188 |
-| 2 | 4 | libxsmm | 0.937 s | 75,092 | 43,989 |
-| 4 | 8 | oneDNN | 0.822 s | 85,645 | 27,385 |
-| 4 | 8 | libxsmm | 0.665 s | 105,813 | 47,365 |
-
-### Performance comparison (8192³, pcl-spr nodes)
-
-| Nodes | Ranks | Backend | Wall time/call | Total GFLOP/s | Per-rank compute GFLOP/s |
-|-------|-------|---------|---------------|---------------|--------------------------|
-| 2 | 4 | oneDNN | 0.0454 s | 24,214 | 27,472 |
-| 2 | 4 | libxsmm | 0.0420 s | 26,180 | 47,141 |
-| 4 | 8 | oneDNN | 0.0371 s | 29,609 | 27,716 |
-| 4 | 8 | libxsmm | 0.0342 s | 32,112 | 47,081 |
-
-libxsmm (sfc_ca_gemm) is ~1.7× faster in per-rank compute throughput.
-Both backends pass correctness with check-norm < 0.004.
