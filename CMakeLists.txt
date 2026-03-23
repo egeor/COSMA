@@ -192,12 +192,35 @@ if (COSMA_WITH_SFC_GEMM)
       libxsmm
       GIT_REPOSITORY https://github.com/libxsmm/libxsmm.git
       GIT_TAG        c14cbc6f8 # main as of 2026-03-20
+      EXCLUDE_FROM_ALL
     )
     set(XSMM_STATIC ON CACHE INTERNAL "")
     FetchContent_MakeAvailable(libxsmm)
-    # The libxsmm CMake creates target "xsmm"; alias it for consistency
-    if (TARGET xsmm AND NOT TARGET libxsmm::libxsmm)
-      add_library(libxsmm::libxsmm ALIAS xsmm)
+    # libxsmm's Makefile generates libxsmm_version.h; CMake doesn't.
+    # Generate it from the template if missing.
+    if (NOT EXISTS "${libxsmm_SOURCE_DIR}/include/libxsmm_version.h")
+      file(READ "${libxsmm_SOURCE_DIR}/src/template/libxsmm_version.h" _ver_tmpl)
+      string(REPLACE "\$VERSION" "1.17-dev" _ver_tmpl "${_ver_tmpl}")
+      string(REPLACE "\$BRANCH"  "main"     _ver_tmpl "${_ver_tmpl}")
+      string(REPLACE "\$MAJOR"   "1"        _ver_tmpl "${_ver_tmpl}")
+      string(REPLACE "\$MINOR"   "17"       _ver_tmpl "${_ver_tmpl}")
+      string(REPLACE "\$UPDATE"  "0"        _ver_tmpl "${_ver_tmpl}")
+      string(REPLACE "\$PATCH"   "0"        _ver_tmpl "${_ver_tmpl}")
+      string(TIMESTAMP _date "%Y%m%d")
+      string(REPLACE "\$DATE"    "${_date}" _ver_tmpl "${_ver_tmpl}")
+      file(WRITE "${libxsmm_SOURCE_DIR}/include/libxsmm_version.h" "${_ver_tmpl}")
+      message(STATUS "Generated libxsmm_version.h")
+    endif()
+    # The libxsmm CMake creates target "xsmm" with PUBLIC include dirs
+    # that use absolute paths. Override with proper generator expressions
+    # so cosma's install export doesn't fail.
+    if (TARGET xsmm)
+      set_target_properties(xsmm PROPERTIES
+        INTERFACE_INCLUDE_DIRECTORIES
+        "$<BUILD_INTERFACE:${libxsmm_SOURCE_DIR}/include>")
+      if (NOT TARGET libxsmm::libxsmm)
+        add_library(libxsmm::libxsmm ALIAS xsmm)
+      endif()
     endif()
     set(LIBXSMM_FOUND TRUE)
   endif()

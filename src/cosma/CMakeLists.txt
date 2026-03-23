@@ -49,7 +49,17 @@ if (COSMA_WITH_SFC_GEMM)
   if (TARGET PkgConfig::LIBXSMM)
     target_link_libraries(cosma PRIVATE PkgConfig::LIBXSMM)
   elseif (TARGET libxsmm::libxsmm)
-    target_link_libraries(cosma PRIVATE libxsmm::libxsmm)
+    # When libxsmm is fetched via FetchContent, link by file path
+    # to avoid polluting the install export set.
+    if (TARGET xsmm)
+      target_include_directories(cosma PRIVATE
+        $<TARGET_PROPERTY:xsmm,INTERFACE_INCLUDE_DIRECTORIES>)
+      target_link_libraries(cosma PRIVATE $<TARGET_FILE:xsmm>)
+      # Ensure xsmm is built before cosma
+      add_dependencies(cosma xsmm)
+    else()
+      target_link_libraries(cosma PRIVATE libxsmm::libxsmm)
+    endif()
   endif()
   find_package(OpenMP COMPONENTS CXX)
   if (OpenMP_CXX_FOUND)
@@ -63,7 +73,7 @@ target_link_libraries(cosma PUBLIC
   costa::costa
   $<TARGET_NAME_IF_EXISTS:roc::rccl>
   $<TARGET_NAME_IF_EXISTS:cosma::nccl>
-  $<$<STREQUAL:${COSMA_GPU_VENDOR},"OFF">:cosma::BLAS::blas>
+  $<$<STREQUAL:${COSMA_GPU_BACKEND},OFF>:cosma::BLAS::blas>
   $<TARGET_NAME_IF_EXISTS:Tiled-MM::Tiled-MM>
   $<$<STREQUAL:${COSMA_GPU_BACKEND},CUDA>:Tiled-MM::Tiled-MM>
   $<$<STREQUAL:${COSMA_GPU_BACKEND},ROCM>:Tiled-MM::Tiled-MM>
