@@ -320,12 +320,53 @@ int main(int argc, char **argv) {
 #endif
 
     if (using_onednn) {
-        // oneDNN path: data stays flat column-major. No packing needed.
-        // The gemm() function in blas.cpp handles the oneDNN dispatch.
-        mode_label = "ONEDNN (flat col-major, oneDNN matmul)";
-        if (rank == 0) {
-            std::fprintf(stderr, "[onednn] using oneDNN backend, no blocked packing\n");
-            std::fflush(stderr);
+#ifdef COSMA_WITH_SFC_GEMM
+        if (!can_prepacked) {
+            // Multi-step strategy: pack A to K-outer VNNI for MPI
+            // (identical to libxsmm blocked_comm). B/C stay flat for oneDNN.
+            mode_label = "ONEDNN (blocked-comm A, oneDNN matmul)";
+            auto desc = cosma::get_sfc_gemm_cache().block_desc();
+            int bm = desc.bm, bk = desc.bk;
+
+            auto& a_blocks = A.initial_layout();
+            int local_m_A = a_blocks[0].rows.end_ - a_blocks[0].rows.start_ + 1;
+            int local_k_A = a_blocks[0].cols.end_ - a_blocks[0].cols.start_ + 1;
+            size_t a_sz = (size_t)A.matrix_size();
+
+            // Pack A in-place to K-outer VNNI (same as libxsmm blocked_comm)
+            {
+                bf16 *a_ptr = A.matrix_pointer();
+                int lbm = bm, lbk_a = bk;
+                while (local_m_A % lbm != 0 && lbm > 1) --lbm;
+                while (local_k_A % lbk_a != 0 && lbk_a > 1) --lbk_a;
+                std::vector<bf16> a_tmp(a_sz);
+                if (rank == 0)
+                    std::fprintf(stderr, "[onednn blocked_comm] pack A K-outer: sz=%zu m=%d k=%d bm=%d bk=%d\n",
+                        a_sz, local_m_A, local_k_A, lbm, lbk_a);
+                cosma::pack_A_to_blocked_vnni_Kouter(a_ptr, a_tmp.data(),
+                                                      local_m_A, local_k_A, lbm, lbk_a);
+                std::memcpy(a_ptr, a_tmp.data(), a_sz * sizeof(bf16));
+            }
+            // B stays flat col-major — oneDNN handles it natively
+            // C stays flat col-major — oneDNN handles it natively
+
+            cosma::get_sfc_gemm_cache().set_blocked_comm(true);
+            // Preallocate reshuffle scratch (first-touch + alloc off critical path)
+            cosma::get_sfc_gemm_cache().scratch_A(a_sz);
+
+            if (rank == 0) {
+                std::fprintf(stderr, "[onednn] blocked_comm A (K-outer VNNI), flat B/C\n");
+                std::fflush(stderr);
+            }
+        } else
+#endif
+        {
+            // Single-step (or no SFC_GEMM): data stays flat col-major.
+            mode_label = "ONEDNN (flat col-major, oneDNN matmul)";
+            if (rank == 0) {
+                std::fprintf(stderr, "[onednn] flat col-major path\n");
+                std::fflush(stderr);
+            }
         }
     }
 #ifdef COSMA_WITH_SFC_GEMM
@@ -516,6 +557,9 @@ int main(int argc, char **argv) {
 #ifdef COSMA_WITH_SFC_GEMM
     cosma::get_sfc_gemm_cache().reset_timers();
 #endif
+#ifdef COSMA_WITH_ONEDNN
+    cosma::get_onednn_gemm_cache().reset_pack_cache();
+#endif
     reset_mpi_timers();
 
     PMPI_Barrier(MPI_COMM_WORLD);
@@ -530,10 +574,8 @@ int main(int argc, char **argv) {
     double wall_per_call = (wall1 - wall0) / nreps;
 
 #ifdef COSMA_WITH_SFC_GEMM
-    if (!using_onednn) {
-        cosma::get_sfc_gemm_cache().set_prepacked(false);
-        cosma::get_sfc_gemm_cache().set_blocked_comm(false);
-    }
+    cosma::get_sfc_gemm_cache().set_prepacked(false);
+    cosma::get_sfc_gemm_cache().set_blocked_comm(false);
 #endif
 
     // Gather per-phase timers

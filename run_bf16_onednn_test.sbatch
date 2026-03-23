@@ -8,6 +8,7 @@
 #SBATCH --error=/nfs_home/egeorgan/test_fixed_cosma/COSMA/build/bf16_onednn_%j.err
 #SBATCH --exclusive
 #SBATCH --constraint="c1state"
+#SBATCH --exclude=pcl-spr[01-08],pcl-sprh[01-16]
 
 # Strong scaling: 32768 x 32768 x 32768
 # Usage:  sbatch --nodes=N run_bf16_onednn_test.sbatch
@@ -18,7 +19,7 @@ source /swtools/intel/2025.3/oneapi-vars.sh --force
 
 export OMP_NUM_THREADS=64
 export KMP_AFFINITY=granularity=fine,compact
-export FI_PROVIDER=psm3
+export FI_PROVIDER=psm2
 
 # oneDNN library
 export LD_LIBRARY_PATH=$HOME/onednn_2026/oneDNN/install/lib64:$LD_LIBRARY_PATH

@@ -60,6 +60,16 @@ public:
     /// Reset cached A packing state (force re-pack on next call).
     void reset_pack_cache() { last_A_ptr_ = nullptr; }
 
+    /// Accessors for pack-cache state (used by blas.cpp to split timing).
+    const bfloat16 *last_A_ptr() const { return last_A_ptr_; }
+    size_t last_A_sz() const { return last_A_sz_; }
+    void set_last_A(const bfloat16 *ptr, size_t sz) {
+        last_A_ptr_ = ptr;
+        last_A_sz_ = sz;
+    }
+    /// Return pointer to already-packed A for a given (M,N,K).
+    const bfloat16 *last_packed_A(int M, int N, int K);
+
 private:
     struct matmul_entry;  // pimpl
 

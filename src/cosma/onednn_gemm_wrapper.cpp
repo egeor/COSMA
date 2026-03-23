@@ -210,6 +210,11 @@ void onednn_gemm_cache::gemm(int M, int N, int K,
     gemm_prepacked(M, N, K, e.packed_A.data(), B, C);
 }
 
+const bfloat16 *onednn_gemm_cache::last_packed_A(int M, int N, int K) {
+    auto &e = get_entry(M, N, K);
+    return e.packed_A.data();
+}
+
 // ---------------------------------------------------------------------------
 //  Singleton
 // ---------------------------------------------------------------------------

@@ -171,29 +171,80 @@ void gemm(const int M,
         auto &tm = sfc_cache.timers();
         tm.calls++;
 
-        if (sfc_cache.is_prepacked() || sfc_cache.is_blocked_comm()) {
-            // In blocked-comm / prepacked mode, A/B/C are in sfc_ca_gemm
-            // blocked format. We cannot use those with oneDNN.
-            // Fall through to sfc_ca_gemm path below.
+        if (sfc_cache.is_prepacked()) {
+            // Fully prepacked: all matrices in sfc_ca_gemm blocked format.
             goto sfc_path;
         }
+
+        if (sfc_cache.is_blocked_comm()) {
+            // A is K-outer VNNI from MPI, B/C are flat col-major.
+            // Reshuffle A K-outer → M-outer (same op as libxsmm) then oneDNN compute.
+            auto desc = sfc_cache.block_desc();
+            int bm = desc.bm, bk = desc.bk;
+            while (M % bm != 0 && bm > 1) --bm;
+            while (K % bk != 0 && bk > 1) --bk;
+            size_t a_sz = (size_t)M * K;
+            bfloat16 *A_mouter = sfc_cache.scratch_A(a_sz);
+
+            {
+                auto t0 = clk::now();
+                reshuffle_A_Kouter_to_Mouter(A, A_mouter, M, K, bm, bk);
+                auto t1 = clk::now();
+                tm.pack_a += std::chrono::duration<double>(t1 - t0).count();
+            }
+
+            auto &dnnl_cache_bc = get_onednn_gemm_cache();
+            {
+                auto t0 = clk::now();
+                dnnl_cache_bc.gemm_prepacked(M, N, K, A_mouter, B, C);
+                auto t1 = clk::now();
+                tm.compute += std::chrono::duration<double>(t1 - t0).count();
+            }
+
+            // Handle alpha/beta
+            if (float(alpha) != 1.0f || float(beta) != 0.0f) {
+                const float fa = float(alpha), fb = float(beta);
+                const size_t c_sz = (size_t)M * N;
+                auto t0b = clk::now();
+                #pragma omp parallel for schedule(static)
+                for (size_t i = 0; i < c_sz; ++i) {
+                    C[i] = bfloat16(fa * float(C[i]));
+                }
+                auto t1b = clk::now();
+                tm.unpack_c += std::chrono::duration<double>(t1b - t0b).count();
+            }
+            return;
+        }
 #endif
+        // Flat col-major path (no blocked_comm): full pack + compute
         auto &dnnl_cache = get_onednn_gemm_cache();
 
         {
-        auto t0 = clk::now();
-        // Pack A (weights) if needed — oneDNN reorder to VNNI blocked
-        dnnl_cache.gemm(M, N, K, A, B, C);
-        auto t1 = clk::now();
-        (void)t0; (void)t1;
+        size_t a_sz = (size_t)M * K;
+        const bfloat16 *packed_A;
+        auto t0_pack = clk::now();
+        if (A != dnnl_cache.last_A_ptr() || a_sz != dnnl_cache.last_A_sz()) {
+            packed_A = dnnl_cache.pack_A(M, N, K, A);
+            dnnl_cache.set_last_A(A, a_sz);
+        } else {
+            packed_A = dnnl_cache.last_packed_A(M, N, K);
+        }
+        auto t1_pack = clk::now();
+
+        auto t0_comp = clk::now();
+        dnnl_cache.gemm_prepacked(M, N, K, packed_A, B, C);
+        auto t1_comp = clk::now();
+
+        (void)t0_pack; (void)t1_pack;
+        (void)t0_comp; (void)t1_comp;
 #ifdef COSMA_WITH_SFC_GEMM
-        tm.compute += std::chrono::duration<double>(t1 - t0).count();
+        tm.pack_a  += std::chrono::duration<double>(t1_pack - t0_pack).count();
+        tm.compute += std::chrono::duration<double>(t1_comp - t0_comp).count();
 #endif
 
         // Handle alpha/beta: C = alpha * C_new + beta * C_old
         if (float(alpha) != 1.0f || float(beta) != 0.0f) {
             const float fa = float(alpha), fb = float(beta);
-            // In oneDNN path, C is flat col-major, so simple loop
             const size_t c_sz = (size_t)M * N;
             auto t0b = clk::now();
             #pragma omp parallel for schedule(static)
