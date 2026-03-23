@@ -237,3 +237,114 @@ Total dominated by MPI time (~210 ms); run-to-run variance ~5-7%.
 - Mode 1 benefit is most visible at 8 nodes (+10% local compute throughput)
 - At 4 nodes mode 1 gracefully falls back to leaf reshuffle (no split_n in strategy)
 - MPI communication dominates wall time at all scales (80–90%)
+
+---
+
+## oneDNN Backend Integration
+
+An alternative BF16 GEMM backend using Intel oneDNN can be enabled alongside
+the default sfc_ca_gemm (libxsmm) backend. Both backends use the **same
+`pack_A_to_blocked_vnni` packing routine** for the weight matrix A, producing
+identical VNNI-blocked layouts (`[Mb][Kb][bk/2][bm][2]`, bm=bk=32). The
+activations B and output C remain in flat column-major layout for oneDNN, while
+sfc_ca_gemm blocks all three matrices.
+
+The backend is selected at runtime via the `COSMA_GEMM_BACKEND` environment
+variable.
+
+### Files added/modified
+
+| File | Change |
+|------|--------|
+| `CMakeLists.txt` | Added `COSMA_WITH_ONEDNN` option and `ONEDNN_PATH` variable |
+| `src/cosma/CMakeLists.txt` | Added `onednn_gemm_wrapper.cpp`, oneDNN linkage, `COSMA_WITH_ONEDNN` compile definition |
+| `src/cosma/onednn_gemm_wrapper.hpp` | **New** — `onednn_gemm_cache` class header |
+| `src/cosma/onednn_gemm_wrapper.cpp` | **New** — oneDNN matmul primitive, uses `pack_A_to_blocked_vnni` for A packing |
+| `src/cosma/blas.cpp` | Dispatch to oneDNN in `gemm<bfloat16>()` when `COSMA_GEMM_BACKEND=onednn` |
+| `tests/test_bf16_mpi.cpp` | Conditional compilation with `#ifdef COSMA_WITH_SFC_GEMM` / `COSMA_WITH_ONEDNN` |
+| `run_bf16_onednn_test.sbatch` | **New** — Slurm batch script for both backends |
+
+### Prerequisites
+
+- Intel oneAPI 2025.3+ (compiler, MKL, MPI)
+- oneDNN installed (e.g. `~/onednn_2026/oneDNN/install/` with `lib64/libdnnl.so` and `include/oneapi/dnnl/`)
+- libxsmm (fetched automatically by CMake when `COSMA_WITH_SFC_GEMM=ON`)
+
+### Build
+
+```bash
+# Source Intel environment
+source /swtools/intel/2025.3/oneapi-vars.sh
+
+# Configure with both backends enabled
+cmake .. \
+  -DCMAKE_CXX_COMPILER=mpiicpx \
+  -DCOSMA_BLAS=MKL \
+  -DCOSMA_SCALAPACK=OFF \
+  -DCOSMA_WITH_SFC_GEMM=ON \
+  -DCOSMA_WITH_ONEDNN=ON \
+  -DONEDNN_PATH=$HOME/onednn_2026/oneDNN/install \
+  -DCMAKE_BUILD_TYPE=Release
+
+# Build the test
+make -j$(nproc) test_bf16_mpi
+```
+
+To build with oneDNN only (no libxsmm), omit `-DCOSMA_WITH_SFC_GEMM=ON`.
+In that case, A packing falls back to `dnnl::reorder`.
+
+### Run
+
+```bash
+# Set oneDNN library path
+export LD_LIBRARY_PATH=$HOME/onednn_2026/oneDNN/install/lib64:$LD_LIBRARY_PATH
+
+# Run with oneDNN backend
+export COSMA_GEMM_BACKEND=onednn
+mpirun -n 4 ./numactl_wrapper.sh ./build/tests/test_bf16_mpi 8192 8192 8192 5
+
+# Run with libxsmm backend (default)
+export COSMA_GEMM_BACKEND=libxsmm   # or unset COSMA_GEMM_BACKEND
+mpirun -n 4 ./numactl_wrapper.sh ./build/tests/test_bf16_mpi 8192 8192 8192 5
+```
+
+Or use the Slurm batch script:
+
+```bash
+# 2-node oneDNN test, 8k^3
+sbatch --nodes=2 --export=ALL,COSMA_GEMM_BACKEND=onednn,COSMA_M=8192,COSMA_N=8192,COSMA_K=8192 \
+  run_bf16_onednn_test.sbatch
+
+# 4-node libxsmm test, 32k^3 (default problem size)
+sbatch --nodes=4 --export=ALL,COSMA_GEMM_BACKEND=libxsmm \
+  run_bf16_onednn_test.sbatch
+```
+
+### Environment variables
+
+| Variable | Values | Default | Description |
+|----------|--------|---------|-------------|
+| `COSMA_GEMM_BACKEND` | `onednn`, `dnnl`, `libxsmm`, or unset | libxsmm | Select the BF16 GEMM kernel |
+| `COSMA_M`, `COSMA_N`, `COSMA_K` | integer | 32768 | Problem dimensions (sbatch script) |
+| `COSMA_NREPS` | integer | 5 | Number of timed repetitions (sbatch script) |
+
+### Performance comparison (32768³, pcl-spr nodes)
+
+| Nodes | Ranks | Backend | Wall time/call | Total GFLOP/s | Per-rank compute GFLOP/s |
+|-------|-------|---------|---------------|---------------|--------------------------|
+| 2 | 4 | oneDNN | 1.284 s | 54,790 | 23,188 |
+| 2 | 4 | libxsmm | 0.937 s | 75,092 | 43,989 |
+| 4 | 8 | oneDNN | 0.822 s | 85,645 | 27,385 |
+| 4 | 8 | libxsmm | 0.665 s | 105,813 | 47,365 |
+
+### Performance comparison (8192³, pcl-spr nodes)
+
+| Nodes | Ranks | Backend | Wall time/call | Total GFLOP/s | Per-rank compute GFLOP/s |
+|-------|-------|---------|---------------|---------------|--------------------------|
+| 2 | 4 | oneDNN | 0.0454 s | 24,214 | 27,472 |
+| 2 | 4 | libxsmm | 0.0420 s | 26,180 | 47,141 |
+| 4 | 8 | oneDNN | 0.0371 s | 29,609 | 27,716 |
+| 4 | 8 | libxsmm | 0.0342 s | 32,112 | 47,081 |
+
+libxsmm (sfc_ca_gemm) is ~1.7× faster in per-rank compute throughput.
+Both backends pass correctness with check-norm < 0.004.

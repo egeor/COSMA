@@ -133,8 +133,13 @@ void gemm(const int M,
 #endif
 
 // BFloat16 GEMM via sfc_ca_gemm — always available when COSMA_WITH_SFC_GEMM
+#if defined(COSMA_WITH_SFC_GEMM) || defined(COSMA_WITH_ONEDNN)
 #ifdef COSMA_WITH_SFC_GEMM
 #include <cosma/sfc_gemm_wrapper.hpp>
+#endif
+#ifdef COSMA_WITH_ONEDNN
+#include <cosma/onednn_gemm_wrapper.hpp>
+#endif
 #include <chrono>
 #include <cstring>
 
@@ -152,6 +157,64 @@ void gemm(const int M,
           bfloat16 *C,
           const int ldc) {
     using clk = std::chrono::high_resolution_clock;
+
+#ifdef COSMA_WITH_ONEDNN
+    if (use_onednn_backend()) {
+        // oneDNN path: operates on flat column-major A, B, C.
+        // The oneDNN wrapper handles the col-major→row-major mapping
+        // internally (C(M×N) = A(M×K)*B(K×N) → C^T = B^T * A^T).
+        //
+        // For prepacked or blocked_comm modes the sfc_gemm_cache timers
+        // are used so we grab them from there if available.
+#ifdef COSMA_WITH_SFC_GEMM
+        auto &sfc_cache = get_sfc_gemm_cache();
+        auto &tm = sfc_cache.timers();
+        tm.calls++;
+
+        if (sfc_cache.is_prepacked() || sfc_cache.is_blocked_comm()) {
+            // In blocked-comm / prepacked mode, A/B/C are in sfc_ca_gemm
+            // blocked format. We cannot use those with oneDNN.
+            // Fall through to sfc_ca_gemm path below.
+            goto sfc_path;
+        }
+#endif
+        auto &dnnl_cache = get_onednn_gemm_cache();
+
+        {
+        auto t0 = clk::now();
+        // Pack A (weights) if needed — oneDNN reorder to VNNI blocked
+        dnnl_cache.gemm(M, N, K, A, B, C);
+        auto t1 = clk::now();
+        (void)t0; (void)t1;
+#ifdef COSMA_WITH_SFC_GEMM
+        tm.compute += std::chrono::duration<double>(t1 - t0).count();
+#endif
+
+        // Handle alpha/beta: C = alpha * C_new + beta * C_old
+        if (float(alpha) != 1.0f || float(beta) != 0.0f) {
+            const float fa = float(alpha), fb = float(beta);
+            // In oneDNN path, C is flat col-major, so simple loop
+            const size_t c_sz = (size_t)M * N;
+            auto t0b = clk::now();
+            #pragma omp parallel for schedule(static)
+            for (size_t i = 0; i < c_sz; ++i) {
+                C[i] = bfloat16(fa * float(C[i]));
+            }
+            auto t1b = clk::now();
+            (void)t0b; (void)t1b;
+#ifdef COSMA_WITH_SFC_GEMM
+            tm.unpack_c += std::chrono::duration<double>(t1b - t0b).count();
+#endif
+        }
+        }
+        return;
+    }
+#ifdef COSMA_WITH_SFC_GEMM
+    sfc_path:
+#endif
+#endif // COSMA_WITH_ONEDNN
+
+#ifdef COSMA_WITH_SFC_GEMM
 
     auto &cache = get_sfc_gemm_cache();
     auto  desc  = cache.block_desc();
@@ -294,6 +357,7 @@ void gemm(const int M,
     t1 = clk::now();
     tm.unpack_c += std::chrono::duration<double>(t1 - t0).count();
 }
+#endif // COSMA_WITH_SFC_GEMM
 
 } // namespace cosma
-#endif
+#endif // COSMA_WITH_SFC_GEMM || COSMA_WITH_ONEDNN

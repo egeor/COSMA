@@ -20,7 +20,12 @@
 #include <cosma/context.hpp>
 #include <cosma/matrix.hpp>
 #include <cosma/mpi_mapper.hpp>
+#ifdef COSMA_WITH_SFC_GEMM
 #include <cosma/sfc_gemm_wrapper.hpp>
+#endif
+#ifdef COSMA_WITH_ONEDNN
+#include <cosma/onednn_gemm_wrapper.hpp>
+#endif
 #include <cosma/environment_variables.hpp>
 #include <cosma/blas.hpp>
 #include <mkl.h>
@@ -136,7 +141,9 @@ static bool correctness_test(int rank) {
     }
 
     // Reset pack cache so the correctness test packs freshly
+#ifdef COSMA_WITH_SFC_GEMM
     cosma::get_sfc_gemm_cache().reset_pack_cache();
+#endif
 
     cosma::gemm(M, N, K, bf16(1.0f), A.data(), M, B.data(), K,
                 bf16(0.0f), C.data(), M);
@@ -306,7 +313,23 @@ int main(int argc, char **argv) {
         local_n_C = c_blocks[0].cols.end_ - c_blocks[0].cols.start_ + 1;
     }
 
-    if (can_prepacked) {
+    // Check if we're using oneDNN backend
+    bool using_onednn = false;
+#ifdef COSMA_WITH_ONEDNN
+    using_onednn = cosma::use_onednn_backend();
+#endif
+
+    if (using_onednn) {
+        // oneDNN path: data stays flat column-major. No packing needed.
+        // The gemm() function in blas.cpp handles the oneDNN dispatch.
+        mode_label = "ONEDNN (flat col-major, oneDNN matmul)";
+        if (rank == 0) {
+            std::fprintf(stderr, "[onednn] using oneDNN backend, no blocked packing\n");
+            std::fflush(stderr);
+        }
+    }
+#ifdef COSMA_WITH_SFC_GEMM
+    else if (can_prepacked) {
         mode_label = "PREPACKED";
         auto desc = cosma::get_sfc_gemm_cache().block_desc();
         int bm = desc.bm, bn = desc.bn, bk = desc.bk;
@@ -395,13 +418,19 @@ int main(int argc, char **argv) {
         cosma::get_sfc_gemm_cache().scratch_A(a_sz);
         mode_label = "BLOCKED_COMM (K-outer A, leaf reshuffle)";
     }
+#endif // COSMA_WITH_SFC_GEMM
 
     // 2) Run COSMA multiply (correctness — exercises actual mode)
-    cosma::get_sfc_gemm_cache().reset_pack_cache();
+#ifdef COSMA_WITH_SFC_GEMM
+    if (!using_onednn)
+        cosma::get_sfc_gemm_cache().reset_pack_cache();
+#endif
     cosma::multiply(A, B, C, strategy, MPI_COMM_WORLD, alpha, beta);
 
     // Unpack C from blocked [Nb][Mb][bn][bm] to col-major for correctness
-    if (rank < strategy.P && local_m_C > 0 && local_n_C > 0) {
+    // (only needed for sfc_ca_gemm paths)
+#ifdef COSMA_WITH_SFC_GEMM
+    if (!using_onednn && rank < strategy.P && local_m_C > 0 && local_n_C > 0) {
         auto desc = cosma::get_sfc_gemm_cache().block_desc();
         int bm = desc.bm, bn = desc.bn;
         int lbm = bm, lbn = bn;
@@ -413,6 +442,7 @@ int main(int argc, char **argv) {
                                      local_m_C, local_n_C, lbm, lbn);
         std::memcpy(C.matrix_pointer(), c_tmp.data(), c_sz * sizeof(bf16));
     }
+#endif // COSMA_WITH_SFC_GEMM
 
     // 3) Gather distributed C to rank 0
     std::vector<bf16> all_C_buf;
@@ -483,7 +513,9 @@ int main(int argc, char **argv) {
     PMPI_Barrier(MPI_COMM_WORLD);
 
     // --- Timed performance loop ---
+#ifdef COSMA_WITH_SFC_GEMM
     cosma::get_sfc_gemm_cache().reset_timers();
+#endif
     reset_mpi_timers();
 
     PMPI_Barrier(MPI_COMM_WORLD);
@@ -497,15 +529,24 @@ int main(int argc, char **argv) {
     double wall1 = PMPI_Wtime();
     double wall_per_call = (wall1 - wall0) / nreps;
 
-    cosma::get_sfc_gemm_cache().set_prepacked(false);
-    cosma::get_sfc_gemm_cache().set_blocked_comm(false);
+#ifdef COSMA_WITH_SFC_GEMM
+    if (!using_onednn) {
+        cosma::get_sfc_gemm_cache().set_prepacked(false);
+        cosma::get_sfc_gemm_cache().set_blocked_comm(false);
+    }
+#endif
 
     // Gather per-phase timers
-    auto &tm = cosma::get_sfc_gemm_cache().timers();
-    double local_pack_a   = tm.pack_a   / nreps;
-    double local_pack_b   = tm.pack_b   / nreps;
-    double local_compute  = tm.compute  / nreps;
-    double local_unpack_c = tm.unpack_c / nreps;
+    double local_pack_a = 0, local_pack_b = 0, local_compute = 0, local_unpack_c = 0;
+#ifdef COSMA_WITH_SFC_GEMM
+    {
+        auto &tm = cosma::get_sfc_gemm_cache().timers();
+        local_pack_a   = tm.pack_a   / nreps;
+        local_pack_b   = tm.pack_b   / nreps;
+        local_compute  = tm.compute  / nreps;
+        local_unpack_c = tm.unpack_c / nreps;
+    }
+#endif
     double local_gemm_total = local_pack_a + local_pack_b + local_compute + local_unpack_c;
 
     // MPI breakdown per call
@@ -542,7 +583,7 @@ int main(int argc, char **argv) {
         std::printf("  MPI_ReduceScat : %.4f s  (%d calls)\n", max_t[6], n_reduce_scatter);
         std::printf("  MPI total      : %.4f s\n", max_t[7]);
         std::printf("  other/overhead : %.4f s\n", max_t[8]);
-        double compute_gflops = total_gflops / max_t[2];
+        double compute_gflops = (max_t[2] > 0) ? total_gflops / max_t[2] : 0.0;
         std::printf("  compute-only   : %.1f GFLOP/s (agg), %.1f (per rank)\n",
                     compute_gflops, compute_gflops / nprocs);
         std::cout << "===================================\n";

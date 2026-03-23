@@ -27,6 +27,13 @@ if (COSMA_WITH_SFC_GEMM)
   LIST(APPEND cosma_src_files bf16_instantiations.cpp)
 endif ()
 
+if (COSMA_WITH_ONEDNN)
+  LIST(APPEND cosma_src_files onednn_gemm_wrapper.cpp)
+  if (NOT COSMA_WITH_SFC_GEMM)
+    LIST(APPEND cosma_src_files bf16_instantiations.cpp)
+  endif()
+endif ()
+
 if (COSMA_GPU_BACKEND MATCHES "ROCM" OR COSMA_GPU_BACKEND MATCHES "CUDA")
   list(APPEND cosma_src_files "pinned_buffers.cpp")
   if (COSMA_WITH_NCCL OR COSMA_WITH_RCCL)
@@ -67,6 +74,15 @@ if (COSMA_WITH_SFC_GEMM)
   endif()
 endif()
 
+# oneDNN linkage
+if (COSMA_WITH_ONEDNN)
+  if (ONEDNN_PATH)
+    target_include_directories(cosma PRIVATE "${ONEDNN_PATH}/include")
+    target_link_directories(cosma PRIVATE "${ONEDNN_PATH}/lib64")
+  endif()
+  target_link_libraries(cosma PRIVATE dnnl)
+endif()
+
 target_compile_features(cosma PUBLIC cxx_std_14)
 target_link_libraries(cosma PUBLIC
   MPI::MPI_CXX
@@ -92,6 +108,7 @@ target_compile_definitions(cosma PUBLIC
                               $<$<STREQUAL:${COSMA_GPU_BACKEND},CUDA>:COSMA_HAVE_GPU>
                               $<$<STREQUAL:${COSMA_GPU_BACKEND},ROCM>:COSMA_HAVE_GPU>
                               $<$<BOOL:${COSMA_WITH_SFC_GEMM}>:COSMA_WITH_SFC_GEMM>
+                              $<$<BOOL:${COSMA_WITH_ONEDNN}>:COSMA_WITH_ONEDNN>
                               PRIVATE
                               $<$<BOOL:${COSMA_WITH_PROFILING}>:COSMA_WITH_PROFILING>)
 
