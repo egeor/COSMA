@@ -47,6 +47,7 @@ using bf16 = cosma::bfloat16;
 // ---------------------------------------------------------------------------
 static double t_allgather = 0, t_reduce_scatter = 0, t_barrier = 0;
 static int    n_allgather = 0, n_reduce_scatter = 0;
+static size_t bytes_allgather = 0, bytes_reduce_scatter = 0;
 
 extern "C" {
 
@@ -56,6 +57,9 @@ int MPI_Allgather(const void *sb, int sc, MPI_Datatype st,
     int r = PMPI_Allgather(sb, sc, st, rb, rc, rt, c);
     t_allgather += PMPI_Wtime() - t0;
     ++n_allgather;
+    int sz; MPI_Type_size(st, &sz);
+    int comm_sz; MPI_Comm_size(c, &comm_sz);
+    bytes_allgather += (size_t)sc * sz * comm_sz; // total data gathered
     return r;
 }
 
@@ -66,6 +70,10 @@ int MPI_Allgatherv(const void *sb, int sc, MPI_Datatype st,
     int r = PMPI_Allgatherv(sb, sc, st, rb, rc, d, rt, c);
     t_allgather += PMPI_Wtime() - t0;
     ++n_allgather;
+    int sz; MPI_Type_size(st, &sz);
+    int comm_sz; MPI_Comm_size(c, &comm_sz);
+    int total = 0; for (int i = 0; i < comm_sz; ++i) total += rc[i];
+    bytes_allgather += (size_t)total * sz;
     return r;
 }
 
@@ -75,6 +83,9 @@ int MPI_Reduce_scatter_block(const void *sb, void *rb, int rc,
     int r = PMPI_Reduce_scatter_block(sb, rb, rc, dt, op, c);
     t_reduce_scatter += PMPI_Wtime() - t0;
     ++n_reduce_scatter;
+    int sz; MPI_Type_size(dt, &sz);
+    int comm_sz; MPI_Comm_size(c, &comm_sz);
+    bytes_reduce_scatter += (size_t)rc * sz * comm_sz; // total input data
     return r;
 }
 
@@ -84,6 +95,10 @@ int MPI_Reduce_scatter(const void *sb, void *rb, const int *rc,
     int r = PMPI_Reduce_scatter(sb, rb, rc, dt, op, c);
     t_reduce_scatter += PMPI_Wtime() - t0;
     ++n_reduce_scatter;
+    int sz; MPI_Type_size(dt, &sz);
+    int comm_sz; MPI_Comm_size(c, &comm_sz);
+    int total = 0; for (int i = 0; i < comm_sz; ++i) total += rc[i];
+    bytes_reduce_scatter += (size_t)total * sz;
     return r;
 }
 
@@ -99,6 +114,7 @@ int MPI_Barrier(MPI_Comm c) {
 static void reset_mpi_timers() {
     t_allgather = t_reduce_scatter = t_barrier = 0;
     n_allgather = n_reduce_scatter = 0;
+    bytes_allgather = bytes_reduce_scatter = 0;
 }
 
 // Reference GEMM in float32 (col-major, no-trans)
@@ -597,6 +613,10 @@ int main(int argc, char **argv) {
     double local_mpi_total    = local_allgather + local_reduce_scat;
     double local_other        = wall_per_call - local_gemm_total - local_mpi_total;
 
+    // Per-call byte volumes (per rank)
+    double local_ag_bytes  = (double)bytes_allgather / nreps;
+    double local_rs_bytes  = (double)bytes_reduce_scatter / nreps;
+
     // Reduce max across ranks
     double timings[9] = {local_pack_a, local_pack_b, local_compute,
                          local_unpack_c, local_gemm_total,
@@ -604,6 +624,11 @@ int main(int argc, char **argv) {
                          local_mpi_total, local_other};
     double max_t[9];
     PMPI_Reduce(timings, max_t, 9, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+
+    // Max byte volumes across ranks (should be same for all ranks)
+    double byte_vols[2] = {local_ag_bytes, local_rs_bytes};
+    double max_bytes[2];
+    PMPI_Reduce(byte_vols, max_bytes, 2, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     double total_gflops = 2.0 * (double)M * N * K * 1e-9;
 
@@ -621,8 +646,14 @@ int main(int argc, char **argv) {
         std::printf("  compute        : %.4f s\n", max_t[2]);
         std::printf("  unpack_C       : %.4f s\n", max_t[3]);
         std::printf("  gemm total     : %.4f s\n", max_t[4]);
-        std::printf("  MPI_Allgather  : %.4f s  (%d calls)\n", max_t[5], n_allgather);
-        std::printf("  MPI_ReduceScat : %.4f s  (%d calls)\n", max_t[6], n_reduce_scatter);
+        std::printf("  MPI_Allgather  : %.4f s  (%d calls, %.1f MB, %.2f GB/s per rank)\n",
+                    max_t[5], n_allgather,
+                    max_bytes[0] / 1e6,
+                    (max_t[5] > 0) ? max_bytes[0] / max_t[5] / 1e9 : 0.0);
+        std::printf("  MPI_ReduceScat : %.4f s  (%d calls, %.1f MB, %.2f GB/s per rank)\n",
+                    max_t[6], n_reduce_scatter,
+                    max_bytes[1] / 1e6,
+                    (max_t[6] > 0) ? max_bytes[1] / max_t[6] / 1e9 : 0.0);
         std::printf("  MPI total      : %.4f s\n", max_t[7]);
         std::printf("  other/overhead : %.4f s\n", max_t[8]);
         double compute_gflops = (max_t[2] > 0) ? total_gflops / max_t[2] : 0.0;

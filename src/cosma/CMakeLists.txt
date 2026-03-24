@@ -25,6 +25,11 @@ endif ()
 if (COSMA_WITH_SFC_GEMM)
   LIST(APPEND cosma_src_files sfc_gemm_wrapper.cpp)
   LIST(APPEND cosma_src_files bf16_instantiations.cpp)
+  # KNN performance model (C sources)
+  LIST(APPEND cosma_src_files
+    ${SFC_CA_GEMM_INCLUDE_DIR}/knn_model.c
+    ${SFC_CA_GEMM_INCLUDE_DIR}/knn_model_emr.c
+    ${SFC_CA_GEMM_INCLUDE_DIR}/knn_model_gnr.c)
 endif ()
 
 if (COSMA_WITH_ONEDNN)

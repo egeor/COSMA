@@ -13,9 +13,12 @@
 
 #include <cosma/sfc_gemm_wrapper.hpp>
 
+#include <knn_model.h>
+
 #include <cassert>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <vector>
 
 namespace cosma {
@@ -74,6 +77,19 @@ void *sfc_gemm_cache::get_config(int M, int N, int K) {
     long kbf = desc_.kbf;
     long K_layers = desc_.K_layers;
 
+    // Use KNN performance model to predict optimal kbf/K_layers
+    static int use_knn = -1;
+    if (use_knn < 0) {
+        const char *env = std::getenv("COSMA_USE_KNN_MODEL");
+        use_knn = (env && std::atoi(env) != 0) ? 1 : 0;
+    }
+    if (use_knn) {
+        int pred_kbf, pred_K_layers;
+        predict_config_knn(M, N, K, &pred_kbf, &pred_K_layers);
+        kbf = pred_kbf;
+        K_layers = pred_K_layers;
+    }
+
     gemm_config_t *cfg = setup_gemm_config<libxsmm_bfloat16>(
         M, N, K, bm, bn, bk, kbf, K_layers,
         /*m_step=*/1, /*n_step=*/1,
@@ -82,9 +98,10 @@ void *sfc_gemm_cache::get_config(int M, int N, int K) {
 
     std::fprintf(stderr,
         "[sfc_ca_gemm] new config: M=%d N=%d K=%d bm=%d bn=%d bk=%d "
-        "kbf=%ld K_layers=%ld brcount=%ld a_k_outer=%d\n",
+        "kbf=%ld K_layers=%ld brcount=%ld a_k_outer=%d%s\n",
         M, N, K, bm, bn, bk, kbf, K_layers, 
-        static_cast<gemm_config_t *>(cfg)->brcount, ako);
+        static_cast<gemm_config_t *>(cfg)->brcount, ako,
+        use_knn ? " (KNN)" : "");
     std::fflush(stderr);
 
     cache_[key] = cfg;
