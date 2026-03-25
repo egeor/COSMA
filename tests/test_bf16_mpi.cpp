@@ -210,7 +210,35 @@ int main(int argc, char **argv) {
     }
     if (argc > 4) nreps = std::atoi(argv[4]);
 
-    cosma::Strategy strategy(M, N, K, nprocs);
+    // Build strategy: use COSMA_STRATEGY env var if set (e.g. "pm2,pn2,pk2"),
+    // otherwise auto-select.
+    cosma::Strategy strategy = [&]() {
+        const char *env = std::getenv("COSMA_STRATEGY");
+        if (env && env[0]) {
+            // Parse comma-separated step tokens
+            std::vector<int> divs;
+            std::string dims, types;
+            std::string s(env);
+            size_t pos = 0;
+            while (pos < s.size()) {
+                size_t next = s.find(',', pos);
+                if (next == std::string::npos) next = s.size();
+                std::string tok = s.substr(pos, next - pos);
+                // trim whitespace
+                while (!tok.empty() && tok[0] == ' ') tok.erase(0, 1);
+                while (!tok.empty() && tok.back() == ' ') tok.pop_back();
+                if (tok.size() >= 3) {
+                    types += tok[0];
+                    dims  += tok[1];
+                    divs.push_back(std::atoi(tok.c_str() + 2));
+                }
+                pos = next + 1;
+            }
+            long long mem = cosma::get_cpu_max_memory<bf16>();
+            return cosma::Strategy(M, N, K, nprocs, divs, dims, types, mem);
+        }
+        return cosma::Strategy(M, N, K, nprocs);
+    }();
     if (cosma::get_overlap_comm_and_comp()) {
         strategy.enable_overlapping_comm_and_comp();
     }
